@@ -1,0 +1,344 @@
+#!/bin/bash
+
+set -euo pipefail
+
+APPID=271590
+GTA_DIR_NAME="Grand Theft Auto V"
+SETUP_URL="https://cdn.majestic-files.net/launcher/cis/MajesticLauncherSetup.exe"
+
+STEAM_ROOT="$HOME/.local/share/Steam"
+if [ ! -d "$STEAM_ROOT/steamapps" ]; then
+    STEAM_ROOT="$(readlink -f "$HOME/.steam/steam" 2>/dev/null || true)"
+fi
+
+PFX="$STEAM_ROOT/steamapps/compatdata/$APPID/pfx"
+LAUNCHER="$PFX/drive_c/users/steamuser/AppData/Local/MajesticLauncher/Majestic Launcher.exe"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/majestic-linux"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/majestic-linux"
+
+LAUNCHER_PROC='^[A-Za-z]:\\.*Majestic Launcher\.exe'
+
+pause() {
+    if [ -t 0 ]; then
+        read -rp "Нажмите Enter, чтобы закрыть окно..." _ || true
+    fi
+}
+
+die() {
+    printf '\n%s\n\n' "$*" >&2
+    pause
+    exit 1
+}
+
+strw() {
+    local w
+    w=$(printf '%s' "$1" | LC_ALL=C.UTF-8 wc -m)
+    echo "${w//[[:space:]]/}"
+}
+
+term_cols() { tput cols 2>/dev/null || echo 80; }
+term_rows() { tput lines 2>/dev/null || echo 24; }
+
+max_width() {
+    local line w max=0
+    while IFS= read -r line; do
+        w=$(strw "$line")
+        if (( w > max )); then max=$w; fi
+    done
+    echo "$max"
+}
+
+center_block() {
+    local cols=$1 max=0 w pad line
+    local -a lines=()
+    while IFS= read -r line; do
+        lines+=("$line")
+        w=$(strw "$line")
+        if (( w > max )); then max=$w; fi
+    done
+    pad=$(( (cols - max) / 2 ))
+    if (( pad < 0 )); then pad=0; fi
+    for line in "${lines[@]}"; do
+        printf '%*s%s\n' "$pad" '' "$line"
+    done
+}
+
+art_install() {
+    cat <<'EOF'
+██╗███╗░░██╗░██████╗████████╗░█████╗░██╗░░░░░██╗░░░░░  ░██████╗░████████╗░█████╗░
+██║████╗░██║██╔════╝╚══██╔══╝██╔══██╗██║░░░░░██║░░░░░  ██╔════╝░╚══██╔══╝██╔══██╗
+██║██╔██╗██║╚█████╗░░░░██║░░░███████║██║░░░░░██║░░░░░  ██║░░██╗░░░░██║░░░███████║
+██║██║╚████║░╚═══██╗░░░██║░░░██╔══██║██║░░░░░██║░░░░░  ██║░░╚██╗░░░██║░░░██╔══██║
+██║██║░╚███║██████╔╝░░░██║░░░██║░░██║███████╗███████╗  ╚██████╔╝░░░██║░░░██║░░██║
+╚═╝╚═╝░░╚══╝╚═════╝░░░░╚═╝░░░╚═╝░░╚═╝╚══════╝╚══════╝  ░╚═════╝░░░░╚═╝░░░╚═╝░░╚═╝
+EOF
+}
+
+art_legacy() {
+    cat <<'EOF'
+██╗░░░░░███████╗░██████╗░░█████╗░░█████╗░██╗░░░██╗  ███████╗██████╗░░█████╗░███╗░░░███╗
+██║░░░░░██╔════╝██╔════╝░██╔══██╗██╔══██╗╚██╗░██╔╝  ██╔════╝██╔══██╗██╔══██╗████╗░████║
+██║░░░░░█████╗░░██║░░██╗░███████║██║░░╚═╝░╚████╔╝░  █████╗░░██████╔╝██║░░██║██╔████╔██║
+██║░░░░░██╔══╝░░██║░░╚██╗██╔══██║██║░░██╗░░╚██╔╝░░  ██╔══╝░░██╔══██╗██║░░██║██║╚██╔╝██║
+███████╗███████╗╚██████╔╝██║░░██║╚█████╔╝░░░██║░░░  ██║░░░░░██║░░██║╚█████╔╝██║░╚═╝░██║
+╚══════╝╚══════╝░╚═════╝░╚═╝░░╚═╝░╚════╝░░░░╚═╝░░░  ╚═╝░░░░░╚═╝░░╚═╝░╚════╝░╚═╝░░░░░╚═╝
+EOF
+}
+
+art_steam() {
+    cat <<'EOF'
+░██████╗████████╗███████╗░█████╗░███╗░░░███╗
+██╔════╝╚══██╔══╝██╔════╝██╔══██╗████╗░████║
+╚█████╗░░░░██║░░░█████╗░░███████║██╔████╔██║
+░╚═══██╗░░░██║░░░██╔══╝░░██╔══██║██║╚██╔╝██║
+██████╔╝░░░██║░░░███████╗██║░░██║██║░╚═╝░██║
+╚═════╝░░░░╚═╝░░░╚══════╝╚═╝░░╚═╝╚═╝░░░░░╚═╝
+EOF
+}
+
+no_gta_screen() {
+    local cols rows widest=0 w height top i
+    local msg1="Grand Theft Auto V (Legacy) не найдена в основной библиотеке Steam."
+    local msg2="Установите её через Steam и запустите скрипт снова."
+    local msg3="Нажмите Enter, чтобы закрыть окно"
+
+    cols=$(term_cols)
+    rows=$(term_rows)
+
+    for w in "$(art_install | max_width)" "$(art_legacy | max_width)" "$(art_steam | max_width)"; do
+        if (( w > widest )); then widest=$w; fi
+    done
+
+    clear 2>/dev/null || true
+
+    if (( cols < widest )); then
+        printf '\n%s\n%s\n\n' "$msg1" "$msg2"
+        pause
+        return
+    fi
+
+    height=$(( 18 + 3 + 3 ))
+    top=$(( (rows - height) / 2 ))
+    if (( top < 0 )); then top=0; fi
+    for (( i = 0; i < top; i++ )); do echo; done
+
+    art_install | center_block "$cols"
+    echo
+    art_legacy | center_block "$cols"
+    echo
+    art_steam | center_block "$cols"
+    echo
+    printf '%s\n%s\n' "$msg1" "$msg2" | center_block "$cols"
+    echo
+    if [ -t 0 ]; then
+        printf '%s\n' "$msg3" | center_block "$cols"
+        read -r _ || true
+    fi
+}
+
+gta_installed() {
+    [ -f "$STEAM_ROOT/steamapps/appmanifest_${APPID}.acf" ] &&
+        [ -f "$STEAM_ROOT/steamapps/common/$GTA_DIR_NAME/PlayGTAV.exe" ]
+}
+
+has_powershell() {
+    grep -qsxF powershell "$PFX/winetricks.log" || [ -f "$STATE_DIR/powershell.done" ]
+}
+
+has_launcher() {
+    [ -f "$LAUNCHER" ]
+}
+
+has_patch() {
+    [ -f "$PFX/drive_c/majestic/steam-run.bat" ] &&
+        grep -qsF 'steam-run.bat' "$PFX/system.reg"
+}
+
+all_set() {
+    has_powershell && has_launcher && has_patch
+}
+
+launcher_running() {
+    pgrep -f "$LAUNCHER_PROC" >/dev/null 2>&1
+}
+
+ensure_protontricks() {
+    if command -v protontricks >/dev/null 2>&1 && command -v protontricks-launch >/dev/null 2>&1; then
+        return 0
+    fi
+
+    local pm
+    local -a install_cmd
+    if command -v pacman >/dev/null 2>&1; then
+        pm="pacman"
+        install_cmd=(sudo pacman -S --needed --noconfirm protontricks)
+    elif command -v apt-get >/dev/null 2>&1; then
+        pm="apt"
+        install_cmd=(sudo apt-get install -y protontricks)
+    elif command -v dnf >/dev/null 2>&1; then
+        pm="dnf"
+        install_cmd=(sudo dnf install -y protontricks)
+    else
+        die "Пакет protontricks не установлен, а поддерживаемый пакетный менеджер (pacman, apt, dnf) не найден.
+Установите protontricks вручную (не рекомендуется использовать Flatpak-версию) и запустите скрипт снова."
+    fi
+
+    echo "Пакет protontricks не установлен (менеджер: $pm)."
+    if [ ! -t 0 ]; then
+        die "Нужен интерактивный терминал, чтобы спросить разрешение на установку."
+    fi
+
+    local answer
+    read -rp "Установить protontricks? [Y/n] " answer
+    case "${answer:-Y}" in
+        [yY]|[yY][eE][sS])
+            echo "Устанавливаю protontricks..."
+            "${install_cmd[@]}" || die "Ошибка установки protontricks."
+            ;;
+        *)
+            die "Установка отменена. Установите protontricks самостоятельно
+(лучше через пакетный менеджер, а не Flatpak) и запустите скрипт снова."
+            ;;
+    esac
+
+    command -v protontricks >/dev/null 2>&1 || die "protontricks не найден после установки."
+}
+
+install_powershell() {
+    echo "Установка powershell в префикс GTA V ($APPID)..."
+    protontricks "$APPID" powershell || die "Не удалось установить powershell в префикс."
+    mkdir -p "$STATE_DIR"
+    touch "$STATE_DIR/powershell.done"
+}
+
+install_launcher() {
+    mkdir -p "$CACHE_DIR"
+    echo "Скачиваю Majestic Launcher..."
+    curl -fL --progress-bar -o "$CACHE_DIR/MajesticLauncherSetup.exe" "$SETUP_URL" ||
+        die "Не удалось скачать установщик лаунчера."
+
+    echo "Запускаю установщик. Пройдите его до конца."
+    protontricks-launch --appid "$APPID" "$CACHE_DIR/MajesticLauncherSetup.exe" ||
+        die "Установщик лаунчера завершился с ошибкой."
+    
+    sleep 5
+
+    has_launcher || die "Лаунчер не найден после установки:
+$LAUNCHER"
+}
+
+kill_launcher() {
+    if ! launcher_running; then
+        return 0
+    fi
+
+    pkill -f "$LAUNCHER_PROC" || true
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        launcher_running || break
+        sleep 1
+    done
+    pkill -9 -f "$LAUNCHER_PROC" 2>/dev/null || true
+    protontricks -c 'wineserver -k' "$APPID" >/dev/null 2>&1 || true
+}
+
+patch_prefix() {
+    kill_launcher
+
+    echo "Устанавливаю патч..."
+    mkdir -p "$PFX/drive_c/majestic"
+
+    cat > "$PFX/drive_c/majestic/steam-run.bat" <<'EOF'
+@echo off
+set "GAMEARGS="
+for /f "tokens=4 delims=/" %%a in ("%~1") do set "GAMEARGS=%%a"
+cd /d "S:\steamapps\common\Grand Theft Auto V"
+start "" PlayGTAV.exe %GAMEARGS%
+EOF
+    sed -i 's/$/\r/' "$PFX/drive_c/majestic/steam-run.bat"
+
+    cat > "$PFX/drive_c/majestic/handler.reg" <<'EOF'
+Windows Registry Editor Version 5.00
+
+[HKEY_LOCAL_MACHINE\Software\Classes\steam]
+@="URL:steam protocol"
+"URL Protocol"=""
+
+[HKEY_LOCAL_MACHINE\Software\Classes\steam\shell\open\command]
+@="C:\\windows\\system32\\cmd.exe /c C:\\majestic\\steam-run.bat \"%1\""
+EOF
+
+    protontricks -c 'wine regedit "C:\\majestic\\handler.reg"' "$APPID" ||
+        die "Не удалось применить патч реестра."
+
+    local i
+    for i in 1 2 3 4 5 6 7 8 9 10; do
+        has_patch && return 0
+        sleep 1
+    done
+    die "Патч не применился: в реестре префикса нет обработчика steam://."
+}
+
+find_proton() {
+    local p="$STEAM_ROOT/steamapps/common/Proton - Experimental/proton"
+    [ -x "$p" ] || return 1
+    printf '%s\n' "$p"
+}
+
+launch_launcher() {
+    pgrep -x steam >/dev/null 2>&1 ||
+        die "Steam не запущен. Запустите Steam, войдите в аккаунт и повторите."
+
+    local proton
+    proton=$(find_proton) ||
+        die "Proton Experimental не найден. Установите его в Steam и выберите для GTA V."
+
+    has_launcher || die "Лаунчер не установлен: $LAUNCHER"
+
+    ln -sfn "$STEAM_ROOT" "$PFX/dosdevices/s:"
+
+    mkdir -p "$STATE_DIR"
+    setsid -f env \
+        STEAM_COMPAT_CLIENT_INSTALL_PATH="$STEAM_ROOT" \
+        STEAM_COMPAT_DATA_PATH="$STEAM_ROOT/steamapps/compatdata/$APPID" \
+        STEAM_COMPAT_INSTALL_PATH="$STEAM_ROOT/steamapps/common/$GTA_DIR_NAME" \
+        STEAM_COMPAT_LIBRARY_PATHS="$STEAM_ROOT/steamapps" \
+        STEAM_COMPAT_MOUNTS="$STEAM_ROOT" \
+        STEAM_COMPAT_APP_ID="$APPID" \
+        SteamAppId="$APPID" SteamGameId="$APPID" \
+        "$proton" run "$LAUNCHER" -disable-gpu \
+        >"$STATE_DIR/launcher.log" 2>&1 </dev/null
+    sleep 1
+}
+
+main() {
+    if ! gta_installed; then
+        no_gta_screen
+        exit 1
+    fi
+
+    [ -d "$PFX" ] ||
+        die "Префикс GTA V не найден. Запустите GTA V один раз через Steam (Proton Experimental) и повторите."
+
+    if all_set; then
+        if launcher_running; then
+            echo "Majestic Launcher уже запущен."
+            sleep 2
+            exit 0
+        fi
+        launch_launcher
+        exit 0
+    fi
+
+    ensure_protontricks
+    has_powershell || install_powershell
+    has_launcher || install_launcher
+    has_patch || patch_prefix
+
+    kill_launcher
+    launch_launcher
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi
