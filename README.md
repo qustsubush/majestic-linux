@@ -10,12 +10,12 @@
 Установка и запуск происходят следующим образом (установку следует выполнять из домашней директории):
 
 ```bash
-  mkdir -p majestic-linux
-  curl -fSL -o majestic-linux/majestic-linux https://github.com/qustsubush/majestic-linux/releases/latest/download/majestic-linux
-  chmod +x majestic-linux/majestic-linux
+mkdir -p majestic-linux
+curl -fSL -o majestic-linux/majestic-linux https://github.com/qustsubush/majestic-linux/releases/latest/download/majestic-linux
+chmod +x majestic-linux/majestic-linux
   
   # Запуск
-  ./majestic-linux/majestic-linux
+./majestic-linux/majestic-linux
 ```
 
 Следуйте инструкциям внутри скрипта. В случае возникновения проблем Вы можете воспользоваться видео-руководством:
