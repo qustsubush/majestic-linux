@@ -34,7 +34,23 @@ chmod +x majestic-linux/majestic-linux
 6. Запустите Launcher.exe
 7. После авторизации в Social Club перейдите в настройки и отключите пункт "Отключать клавишу Windows". После отключения проблема исчезнет
 
-Решение проблемы дали разработчики Majestic-RP-Linux-Runner
+Решение проблемы взято с Discrod сервера Majestic-RP-Linux-Runner
+
+</details>
+
+<details>
+  <summary>Появляются артефакты на интерфейсе</summary>
+
+Для решения проблемы нужно выключить CEF в настройказ мультиплеера
+
+1. Откройте конфигурационный файл мультиплеера
+```bash
+# Используйте любой другой установленный у вас текстовый редактор
+nano ~/.local/share/Steam/steamapps/compatdata/271590/pfx/drive_c/users/steamuser/AppData/Roaming/majestic-launcher/Multiplayer/majestic.json
+```
+2. Измените параметр `cefUseHardwareAcceleration` с `true` на `false`
+
+Решение проблемы взято с Discrod сервера Majestic-RP-Linux-Runner
 
 </details>
 
