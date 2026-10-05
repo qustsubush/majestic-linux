@@ -54,6 +54,33 @@ nano ~/.local/share/Steam/steamapps/compatdata/271590/pfx/drive_c/users/steamuse
 
 </details>
 
+<details>
+  <summary>Хочу установить ярлык в главном меню (Пуск)</summary>
+
+Чтобы поставить ярлык нужно создать файл в директории пользовательских ярлыков.
+1. Создайте файл .desktop в ~/.local/share/applications/ через Ваш текстовый редактор
+~~~bash
+# Название файла не влияет на название ярлыка
+nano ~/.local/share/applications/majestic.desktop
+~~~
+2. Внутри файла нужно вставить этот текст:
+```txt
+[Desktop Entry]
+# Название ярдыка
+Name=Majestic Launcher - Linux
+Comment=Majestic Launcher
+# Указываете в ковычках путь до скрипта
+Exec=bash -c '"$HOME/majestic-linux/majestic-linux"'
+# Иконка ярлыка
+Icon=steam_icon_271590
+Terminal=true
+Type=Application
+Categories=Game;
+```
+3. Сохраняете файл и проверяете ярлык
+
+</details>
+
 ## ☕ Поддержать проект
 
 Если этот инструмент оказался для вас полезным, вы можете поддержать его разработку. Любая сумма помогает уделять больше времени улучшению проекта и исправлению багов.
