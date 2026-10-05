@@ -66,7 +66,7 @@ nano ~/.local/share/applications/majestic.desktop
 2. Внутри файла нужно вставить этот текст:
 ```txt
 [Desktop Entry]
-# Название ярдыка
+# Название ярkыка
 Name=Majestic Launcher - Linux
 Comment=Majestic Launcher
 # Указываете в ковычках путь до скрипта
