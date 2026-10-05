@@ -18,7 +18,7 @@ chmod +x majestic-linux/majestic-linux
 ./majestic-linux/majestic-linux
 ```
 
-Следуйте инструкциям внутри скрипта. В случае возникновения проблем можете связаться со мной в Discord: qustsu
+Следуйте инструкциям внутри скрипта. В случае возникновения проблем можете связаться ко мне в Discord: qustsu
 
 ## ❔FaQ (ЧАВО)
 <details>
