@@ -18,6 +18,8 @@ CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/majestic-linux"
 
 LAUNCHER_PROC='^[A-Za-z]:\\.*Majestic Launcher\.exe'
 
+TERMINAL_PID=$(ps -o ppid= -p $$ | tr -d ' ')
+
 pause() {
     if [ -t 0 ]; then
         read -rp "Нажмите Enter, чтобы закрыть окно..." _ || true
@@ -323,11 +325,11 @@ main() {
     if all_set; then
         if launcher_running; then
             echo "Majestic Launcher уже запущен."
-            sleep 2
-            exit 0
+            sleep 10
+            kill -HUP $TERMINAL_PID 2>/dev/null
         fi
         launch_launcher
-        exit 0
+        kill -HUP $TERMINAL_PID 2>/dev/null
     fi
 
     ensure_protontricks
