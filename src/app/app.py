@@ -15,21 +15,24 @@ from PySide6.QtGui import (
     QPolygonF,
 )
 from PySide6.QtWidgets import (
-    QAbstractButton, QApplication, QFileDialog, QFrame, QHBoxLayout, QLabel,
+    QAbstractButton, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QMainWindow, QPlainTextEdit,
-    QMessageBox, QPushButton, QStackedWidget, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
 )
 
 SRC_DIR = Path(__file__).resolve().parents[1]
+APP_DIR = Path(__file__).resolve().parent
 RES_DIR = Path(getattr(sys, "_MEIPASS", SRC_DIR))
 sys.path.insert(0, str(SRC_DIR))
+sys.path.insert(0, str(APP_DIR))
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.services.warning=false")
 
-import patching.patch as core
-from patching import i18n, logs
-from patching.i18n import t
+import backend.patch as core
+import i18n
+from backend import logs, patch_proton
+from i18n import t
 
-APP_VERSION = "2.0.0"
+APP_VERSION = "2.1.0"
 APP_ID = "majestic-linux"
 DESKTOP_ID = "majesticrplinux"
 GITHUB_URL = "https://github.com/qustsubush/majestic-linux"
@@ -56,6 +59,8 @@ QPushButton#play {{
 QPushButton#play:hover {{ background: #5a8fc5; }}
 QPushButton#play:disabled {{ background: #333333; border-color: #3c3c3c; color: #777777; }}
 QPushButton#play[running="true"] {{ background: #a54b4b; border-color: #a54b4b; }}
+QPushButton#play[big="true"] {{ font-size: 20px; }}
+QComboBox QAbstractItemView {{ background: #1b1b1b; selection-background-color: #2e2e2e; outline: 0; }}
 #panel {{ background: #1b1b1b; border: 1px solid #3c3c3c; border-radius: 3px; }}
 QListWidget {{ background: #1b1b1b; border: none; outline: 0; }}
 QListWidget::item {{ padding: 9px 12px; }}
@@ -93,10 +98,12 @@ def open_logs():
 
 
 def load_config(s: QSettings) -> core.Config:
-    return core.Config(
-        installer=str(s.value("installer", "")),
+    cfg = core.Config(
         extra_args=str(s.value("extra_args", DEFAULT_ARGS)),
+        proton=str(s.value("proton", "")),
     )
+    core.use_config(cfg)
+    return cfg
 
 
 class LangSwitch(QAbstractButton):
@@ -142,6 +149,34 @@ class LangSwitch(QAbstractButton):
             active = abs(self._pos - i) < 0.5
             p.setPen(QColor("white" if active else "#8a8a8a"))
             p.drawText(cell, Qt.AlignCenter, text)
+
+
+def _mix(a: str, b: str, k: float) -> QColor:
+    ca, cb = QColor(a), QColor(b)
+    return QColor(
+        round(ca.red() + (cb.red() - ca.red()) * k),
+        round(ca.green() + (cb.green() - ca.green()) * k),
+        round(ca.blue() + (cb.blue() - ca.blue()) * k),
+    )
+
+
+class ToggleSwitch(LangSwitch):
+    def __init__(self, checked: bool = False):
+        super().__init__(checked)
+        self.setFixedSize(44, 24)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        p.setPen(QPen(QColor("#3c3c3c"), 1))
+        p.setBrush(_mix("#2b2b2b", ACCENT, self._pos))
+        p.drawRoundedRect(QRectF(0.5, 0.5, w - 1, h - 1), h / 2, h / 2)
+        d = h - 6
+        x = 3 + (w - 6 - d) * self._pos
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor("white" if self.isChecked() else "#8a8a8a"))
+        p.drawEllipse(QRectF(x, 3, d, d))
 
 
 def reset_icon() -> QIcon:
@@ -194,31 +229,26 @@ class SettingRow(QFrame):
         self.desc.setText(desc)
 
 
-class PathEditor(QWidget):
-    def __init__(self, settings: QSettings, key: str):
+class SettingRow(QFrame):
+    def __init__(self, widget: QWidget):
         super().__init__()
-        self.settings = settings
-        self.key = key
+        self.setObjectName("row")
         lay = QHBoxLayout(self)
-        lay.setContentsMargins(0, 0, 0, 0)
-        self.edit = QLineEdit(str(settings.value(key, "")))
-        self.edit.setMinimumWidth(260)
-        self.edit.editingFinished.connect(lambda: settings.setValue(key, self.edit.text()))
-        self.btn = QPushButton()
-        self.btn.clicked.connect(self.browse)
-        lay.addWidget(self.edit, 1)
-        lay.addWidget(self.btn)
+        lay.setContentsMargins(0, 10, 0, 10)
+        texts = QVBoxLayout()
+        texts.setSpacing(2)
+        self.title = QLabel()
+        self.desc = QLabel()
+        self.desc.setObjectName("muted")
+        self.desc.setWordWrap(True)
+        texts.addWidget(self.title)
+        texts.addWidget(self.desc)
+        lay.addLayout(texts, 1)
+        lay.addWidget(widget, 0, Qt.AlignVCenter)
 
-    def browse(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, t("settings.installer.caption"), str(Path.home()))
-        if path:
-            self.edit.setText(path)
-            self.settings.setValue(self.key, path)
-
-    def retranslate(self):
-        self.edit.setPlaceholderText(t("settings.installer.placeholder"))
-        self.btn.setText(t("settings.browse"))
+    def set_texts(self, title: str, desc: str):
+        self.title.setText(title)
+        self.desc.setText(desc)
 
 
 class ArgsEditor(QWidget):
@@ -258,16 +288,70 @@ class ArgsEditor(QWidget):
         self.reset_btn.setToolTip(t("settings.args.reset"))
 
 
+class ProtonPicker(QComboBox):
+    changed = Signal()
+    BROWSE = "__browse__"
+
+    def __init__(self, settings: QSettings):
+        super().__init__()
+        self.settings = settings
+        self.setMinimumWidth(260)
+        self.populate()
+        self.activated.connect(self._on_activated)
+
+    def populate(self):
+        current = str(self.settings.value("proton", ""))
+        self.blockSignals(True)
+        self.clear()
+        self.addItem(t("settings.proton.default"), "")
+        for src in patch_proton.list_sources():
+            self.addItem(src.label, src.id)
+        index = self.findData(current)
+        if index < 0:
+            self.addItem(current.partition(":")[2] or current, current)
+            index = self.count() - 1
+        self.addItem(t("settings.proton.browse"), self.BROWSE)
+        self.setCurrentIndex(index)
+        self.blockSignals(False)
+
+    def showPopup(self):
+        self.populate()
+        super().showPopup()
+
+    def _on_activated(self, index: int):
+        value = str(self.itemData(index))
+        if value == self.BROWSE:
+            start = str(Path.home() / ".local/share/Steam")
+            chosen = QFileDialog.getExistingDirectory(self, t("settings.proton.pick"), start)
+            if not chosen:
+                self.populate()
+                return
+            if not (Path(chosen) / "proton").is_file():
+                QMessageBox.warning(self, "Majestic Linux", t("settings.proton.invalid"))
+                self.populate()
+                return
+            value = f"path:{chosen}"
+        if value == str(self.settings.value("proton", "")):
+            self.populate()
+            return
+        self.settings.setValue("proton", value)
+        self.populate()
+        self.changed.emit()
+
+    def retranslate(self):
+        self.populate()
+
+
 class LogBus(QObject):
     line = Signal(str)
 
-    def __init__(self):
+    def __init__(self, prefix: str = ""):
         super().__init__()
+        self.prefix = prefix
         self.session = logs.SessionLog(core.LOGS_DIR)
-        self.session.cleanup((core.LEGACY_LOG,))
 
-    def begin(self, kind: str):
-        path = self.session.begin(kind)
+    def begin(self):
+        path = self.session.begin(self.prefix)
         self.push(t("gui.log_file", path=path))
 
     @Slot(str)
@@ -291,7 +375,7 @@ class Worker(QThread):
     line = Signal(str)
     step = Signal(int, str)
     packages = Signal(list, str, str)
-    finished_with = Signal(int)
+    finished_with = Signal(object)
 
     def __init__(self, job):
         super().__init__()
@@ -300,7 +384,7 @@ class Worker(QThread):
     def run(self):
         code = 1
         try:
-            code = self.job(self) or 0
+            code = self.job(self)
         except core.SetupError as e:
             self.line.emit(t("gui.error", err=e))
         except Exception as e:
@@ -308,76 +392,147 @@ class Worker(QThread):
         self.finished_with.emit(code)
 
 
+_debug_windows: list = []
+
+
+class DebugWindow(QWidget):
+    def __init__(self, cfg: core.Config):
+        super().__init__()
+        self.cfg = cfg
+        self.bus = LogBus()
+        self.worker: Worker | None = None
+        self.setWindowTitle(t("debug.title"))
+        self.resize(780, 480)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+        self.view = new_log_view()
+        self.view.setPlaceholderText(t("log.placeholder"))
+        self.bus.line.connect(self.view.appendPlainText)
+        root.addWidget(self.view, 1)
+
+        bar = QHBoxLayout()
+        self.stop_btn = QPushButton(t("debug.stop_prefix"))
+        self.stop_btn.clicked.connect(self.stop_prefix)
+        self.copy_btn = QPushButton(t("btn.copy_log"))
+        self.copy_btn.clicked.connect(self.copy_log)
+        self.logs_btn = QPushButton(t("btn.open_logs"))
+        self.logs_btn.clicked.connect(open_logs)
+        self.status = QLabel(t("status.running"))
+        self.status.setObjectName("muted")
+        bar.addWidget(self.stop_btn)
+        bar.addWidget(self.copy_btn)
+        bar.addWidget(self.logs_btn)
+        bar.addStretch(1)
+        bar.addWidget(self.status)
+        root.addLayout(bar)
+
+    def start(self):
+        cfg = self.cfg
+
+        def job(w: Worker):
+            w.line.emit(t("gui.launching"))
+            return core.launch(cfg, w.line.emit)
+
+        self.bus.begin()
+        self.worker = Worker(job)
+        self.worker.line.connect(self.bus.push)
+        self.worker.finished_with.connect(self._on_finished)
+        self.worker.start()
+
+    def _running(self) -> bool:
+        return bool(self.worker and self.worker.isRunning())
+
+    def stop_prefix(self):
+        if not self._running():
+            return
+        self.stop_btn.setEnabled(False)
+        self.status.setText(t("status.stopping"))
+        core.stop()
+        QTimer.singleShot(3000, self._force_stop)
+
+    def _force_stop(self):
+        if self._running():
+            core.stop(force=True)
+
+    def copy_log(self):
+        QApplication.clipboard().setText(self.view.toPlainText())
+        self.status.setText(t("status.log_copied"))
+
+    def _on_finished(self, code):
+        self.bus.push(t("gui.finished", code=code))
+        self.stop_btn.setEnabled(False)
+        self.status.setText(t("debug.finished"))
+
+    def closeEvent(self, event):
+        if self._running():
+            answer = QMessageBox.question(self, t("debug.title"), t("debug.confirm_close"))
+            if answer != QMessageBox.Yes:
+                event.ignore()
+                return
+            core.stop(force=True)
+            self.worker.wait(3000)
+        self.bus.close()
+        if self in _debug_windows:
+            _debug_windows.remove(self)
+        super().closeEvent(event)
+
+
 class GeneralPage(QWidget):
     running_changed = Signal(bool)
 
-    def __init__(self, settings: QSettings, bus: LogBus):
+    def __init__(self, settings: QSettings):
         super().__init__()
         self.settings = settings
-        self.bus = bus
+        self.bus = LogBus()
         self.worker: Worker | None = None
-        self._running = False
+        self._busy = False
         self._locked = False
-        self._status_key = "status.ready"
+        self._fail_code = None
 
         root = QVBoxLayout(self)
         root.setContentsMargins(18, 14, 14, 14)
         root.setSpacing(10)
 
-        head = QHBoxLayout()
         self.title = QLabel()
         self.title.setObjectName("pageTitle")
-        self.status = QLabel()
-        self.status.setObjectName("muted")
-        head.addWidget(self.title)
-        head.addStretch(1)
-        head.addWidget(self.status)
-        root.addLayout(head)
+        root.addWidget(self.title)
 
         self.play = QPushButton()
         self.play.setObjectName("play")
+        self.play.setProperty("big", True)
         self.play.setCursor(Qt.PointingHandCursor)
-        self.play.clicked.connect(self.toggle)
-        root.addWidget(self.play)
+        self.play.setFixedSize(300, 80)
+        self.play.clicked.connect(self.start)
 
-        self.warning = QLabel()
-        self.warning.setWordWrap(True)
-        self.warning.setStyleSheet(f"color: {WARN_COLOR};")
-        root.addWidget(self.warning)
-
-        self.log = new_log_view()
-        bus.line.connect(self.log.appendPlainText)
-        root.addWidget(self.log, 1)
-
-        bar = QHBoxLayout()
-        self.copy_btn = QPushButton()
-        self.copy_btn.clicked.connect(self.copy_log)
         self.logs_btn = QPushButton()
+        self.logs_btn.setFixedSize(300, 32)
         self.logs_btn.clicked.connect(open_logs)
-        bar.addWidget(self.copy_btn)
-        bar.addWidget(self.logs_btn)
-        bar.addStretch(1)
-        root.addLayout(bar)
+
+        self.note = QLabel()
+        self.note.setWordWrap(True)
+        self.note.setAlignment(Qt.AlignCenter)
+        self.note.setStyleSheet(f"color: {WARN_COLOR};")
+
+        root.addStretch(1)
+        root.addWidget(self.play, 0, Qt.AlignHCenter)
+        root.addWidget(self.logs_btn, 0, Qt.AlignHCenter)
+        root.addSpacing(6)
+        root.addWidget(self.note)
+        root.addStretch(1)
 
         self.retranslate()
 
     def retranslate(self):
         self.title.setText(t("nav.general"))
-        self.status.setText(t(self._status_key))
-        self.play.setText(t("btn.stop" if self._running else "btn.play"))
-        self.warning.setText(t("general.not_installed"))
-        self.copy_btn.setText(t("btn.copy_log"))
+        self.play.setText(t("status.starting" if self._busy else "btn.play"))
         self.logs_btn.setText(t("btn.open_logs"))
-        self.log.setPlaceholderText(t("log.placeholder"))
         self.refresh()
 
     def showEvent(self, event):
         super().showEvent(event)
         self.refresh()
-
-    def _set_status(self, key: str):
-        self._status_key = key
-        self.status.setText(t(key))
 
     def set_locked(self, locked: bool):
         self._locked = locked
@@ -385,49 +540,59 @@ class GeneralPage(QWidget):
 
     def refresh(self):
         installed = core.is_installed(load_config(self.settings))
-        self.warning.setVisible(not installed)
-        self.play.setEnabled(self._running or (installed and not self._locked))
+        if not installed:
+            self.note.setText(t("general.not_installed"))
+        elif self._fail_code is not None:
+            self.note.setText(t("gui.launch_failed", code=self._fail_code))
+        self.note.setVisible(not installed or self._fail_code is not None)
+        self.play.setEnabled(installed and not self._locked and not self._busy)
 
-    def toggle(self):
-        if self.worker and self.worker.isRunning():
-            self._set_status("status.stopping")
-            core.stop()
-            QTimer.singleShot(3000, lambda: core.stop(force=True))
-            return
+    def _set_busy(self, busy: bool):
+        self._busy = busy
+        self.play.setText(t("status.starting" if busy else "btn.play"))
+        self.running_changed.emit(busy)
+        self.refresh()
 
+    def start(self):
         cfg = load_config(self.settings)
         if not core.is_installed(cfg):
             self.refresh()
             return
+        self._fail_code = None
+        if self.settings.value("debug", False, type=bool):
+            self._start_debug(cfg)
+        else:
+            self._start_plain(cfg)
+
+    def _start_debug(self, cfg: core.Config):
+        win = DebugWindow(cfg)
+        _debug_windows.append(win)
+        win.show()
+        win.start()
+        self.window().close()
+
+    def _start_plain(self, cfg: core.Config):
+        self.bus.begin()
+        stream = self.bus.session.stream()
 
         def job(w: Worker):
             w.line.emit(t("gui.launching"))
-            return core.launch(cfg, w.line.emit)
+            return core.launch(cfg, w.line.emit, detach_out=stream)
 
-        self.bus.begin("launch")
         self.worker = Worker(job)
         self.worker.line.connect(self.bus.push)
         self.worker.finished_with.connect(self._on_finished)
-        self._set_running(True)
+        self._set_busy(True)
         self.worker.start()
 
-    def _set_running(self, running: bool):
-        self._running = running
-        self.play.setText(t("btn.stop" if running else "btn.play"))
-        self.play.setProperty("running", running)
-        self.play.style().unpolish(self.play)
-        self.play.style().polish(self.play)
-        self._set_status("status.running" if running else "status.ready")
-        self.running_changed.emit(running)
-
-    def _on_finished(self, code: int):
+    def _on_finished(self, code):
+        self.worker.wait()
+        if code is None:
+            self.window().close()
+            return
         self.bus.push(t("gui.finished", code=code))
-        self._set_running(False)
-        self.refresh()
-
-    def copy_log(self):
-        QApplication.clipboard().setText(self.log.toPlainText())
-        self._set_status("status.log_copied")
+        self._fail_code = code
+        self._set_busy(False)
 
 
 class InstallPage(QWidget):
@@ -441,10 +606,10 @@ class InstallPage(QWidget):
         "error": ("✗", BAD_COLOR),
     }
 
-    def __init__(self, settings: QSettings, bus: LogBus):
+    def __init__(self, settings: QSettings):
         super().__init__()
         self.settings = settings
-        self.bus = bus
+        self.bus = LogBus("install-")
         self.worker: Worker | None = None
         self._running = False
         self._stopping = False
@@ -508,13 +673,30 @@ class InstallPage(QWidget):
         root.addWidget(self.action)
 
         self.log = new_log_view()
-        bus.line.connect(self.log.appendPlainText)
+        self.bus.line.connect(self.log.appendPlainText)
         root.addWidget(self.log, 1)
+
+        bar = QHBoxLayout()
+        self.copy_log_btn = QPushButton()
+        self.copy_log_btn.clicked.connect(self.copy_log)
+        self.logs_btn = QPushButton()
+        self.logs_btn.clicked.connect(open_logs)
+        bar.addWidget(self.copy_log_btn)
+        bar.addWidget(self.logs_btn)
+        bar.addStretch(1)
+        root.addLayout(bar)
 
         self.retranslate()
 
+    def copy_log(self):
+        QApplication.clipboard().setText(self.log.toPlainText())
+        self.status.setText(t("status.log_copied"))
+        QTimer.singleShot(2000, lambda: self.status.setText(t(self._status_key)))
+
     def retranslate(self):
         self.title.setText(t("nav.install"))
+        self.copy_log_btn.setText(t("btn.copy_log"))
+        self.logs_btn.setText(t("btn.open_logs"))
         self.desc.setText(t("install.desc"))
         self.cmd_copy.setText(t("btn.copy"))
         self.log.setPlaceholderText(t("log.placeholder"))
@@ -617,7 +799,8 @@ class InstallPage(QWidget):
             core.install(cfg, w.line.emit, w.step.emit, w.packages.emit)
             return 0
 
-        self.bus.begin("install")
+        self.log.clear()
+        self.bus.begin()
         self._stopping = False
         self._states = ["pending"] * len(self._titles)
         self._render_steps()
@@ -651,6 +834,7 @@ class InstallPage(QWidget):
 
 class SettingsPage(QWidget):
     language_changed = Signal(str)
+    proton_changed = Signal()
 
     def __init__(self, settings: QSettings):
         super().__init__()
@@ -668,9 +852,10 @@ class SettingsPage(QWidget):
         self.lang_row = SettingRow(self.lang_switch)
         root.addWidget(self.lang_row)
 
-        self.installer = PathEditor(settings, "installer")
-        self.installer_row = SettingRow(self.installer)
-        root.addWidget(self.installer_row)
+        self.proton = ProtonPicker(settings)
+        self.proton.changed.connect(self.proton_changed)
+        self.proton_row = SettingRow(self.proton)
+        root.addWidget(self.proton_row)
 
         self.args = ArgsEditor(settings)
         self.args_row = SettingRow(self.args)
@@ -679,11 +864,14 @@ class SettingsPage(QWidget):
 
         self.retranslate()
 
+    def set_locked(self, locked: bool):
+        self.proton.setEnabled(not locked)
+
     def retranslate(self):
         self.title.setText(t("nav.settings"))
         self.lang_row.set_texts(t("settings.language.title"), t("settings.language.desc"))
-        self.installer_row.set_texts(t("settings.installer.title"), t("settings.installer.desc"))
-        self.installer.retranslate()
+        self.proton_row.set_texts(t("settings.proton.title"), t("settings.proton.desc"))
+        self.proton.retranslate()
         self.args_row.set_texts(t("settings.args.title"), t("settings.args.desc"))
         self.args.retranslate()
 
@@ -700,6 +888,11 @@ class AddPage(QWidget):
         root.addWidget(self.title)
         root.addSpacing(8)
 
+        self.debug_switch = ToggleSwitch(settings.value("debug", False, type=bool))
+        self.debug_switch.toggled.connect(lambda v: settings.setValue("debug", v))
+        self.debug_row = SettingRow(self.debug_switch)
+        root.addWidget(self.debug_row)
+
         self.shortcut_status = QLabel("")
         self.shortcut_status.setObjectName("muted")
         self.shortcut_status.setWordWrap(True)
@@ -714,6 +907,7 @@ class AddPage(QWidget):
 
     def retranslate(self):
         self.title.setText(t("nav.additional"))
+        self.debug_row.set_texts(t("add.debug.title"), t("add.debug.desc"))
         self.shortcut_row.set_texts(t("add.shortcut.title"), t("add.shortcut.desc"))
         self.shortcut_btn.setText(t("add.shortcut.btn"))
         if self._shortcut_msg:
@@ -773,7 +967,7 @@ class MainWindow(QMainWindow):
         core.STATE.mkdir(parents=True, exist_ok=True)
         self.settings = QSettings(str(core.STATE / "config.ini"), QSettings.IniFormat)
         i18n.set_language(str(self.settings.value("language", i18n.DEFAULT)))
-        self.bus = LogBus()
+        logs.SessionLog(core.LOGS_DIR).cleanup((core.LEGACY_LOG,))
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -805,16 +999,19 @@ class MainWindow(QMainWindow):
         outer.addWidget(side)
 
         self.stack = QStackedWidget()
-        self.general = GeneralPage(self.settings, self.bus)
-        self.installer = InstallPage(self.settings, self.bus)
+        self.general = GeneralPage(self.settings)
+        self.installer = InstallPage(self.settings)
         self.settings_page = SettingsPage(self.settings)
         self.pages = [self.general, self.installer, self.settings_page,
                       AddPage(self.settings), AboutPage()]
         for page in self.pages:
             self.stack.addWidget(page)
         self.settings_page.language_changed.connect(self.apply_language)
+        self.settings_page.proton_changed.connect(self.on_proton_changed)
         self.general.running_changed.connect(self.installer.set_locked)
+        self.general.running_changed.connect(self.settings_page.set_locked)
         self.installer.running_changed.connect(self.general.set_locked)
+        self.installer.running_changed.connect(self.settings_page.set_locked)
         outer.addWidget(self.stack, 1)
 
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
@@ -826,8 +1023,13 @@ class MainWindow(QMainWindow):
             core.stop(force=True)
             for w in workers:
                 w.wait(3000)
-        self.bus.close()
+        self.general.bus.close()
+        self.installer.bus.close()
         super().closeEvent(event)
+
+    def on_proton_changed(self):
+        self.general.refresh()
+        self.nav.setCurrentRow(1)
 
     def apply_language(self, code: str):
         i18n.set_language(code)

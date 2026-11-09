@@ -18,11 +18,13 @@ fi
   --workpath "$ROOT/.pyinstaller/work" \
   --specpath "$ROOT/.pyinstaller" \
   --paths "$ROOT/src" \
+  --paths "$ROOT/src/app" \
   --add-data "$ROOT/src/assets:assets" \
-  --hidden-import patching.patch \
-  --hidden-import patching.patch_proton \
-  --hidden-import patching.i18n \
-  --hidden-import patching.logs \
+  --hidden-import backend.patch \
+  --hidden-import backend.patch_proton \
+  --hidden-import backend.steam \
+  --hidden-import backend.logs \
+  --hidden-import i18n \
   --hidden-import PySide6.QtSvg \
   "$ROOT/src/app/app.py"
 

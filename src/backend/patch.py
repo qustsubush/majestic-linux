@@ -16,8 +16,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from patching import patch_proton
-from patching.i18n import t
+from backend import patch_proton, steam
+from i18n import t
 
 Log = Callable[[str], None]
 
@@ -26,8 +26,6 @@ STEAM = Path.home() / ".local/share/Steam"
 GTA_DIR = STEAM / "steamapps/common/Grand Theft Auto V"
 COMPAT = STEAM / "steamapps/compatdata" / str(APP_ID)
 PFX = COMPAT / "pfx"
-STOCK_PROTON = patch_proton.STOCK_PROTON
-PATCHED_PROTON = patch_proton.PATCHED_PROTON
 
 SHORTCUT_NAME = "Majestic RP Linux"
 SHORTCUT_ID = "majesticrplinux"
@@ -36,6 +34,7 @@ STATE = Path.home() / ".local/state/majesticrplinux"
 SHIM_SO = STATE / "nolcall.so"
 LOGS_DIR = STATE / "logs"
 LEGACY_LOG = STATE / "launcher.log"
+UPDATE_STATE = STATE / "applied_update.txt"
 
 STEAM_BAT = PFX / "drive_c/majestic/steam-run.bat"
 OLD_STEAM_BAT = PFX / "drive_c/steam-run.bat"
@@ -49,6 +48,10 @@ EMOJI_URL = "https://github.com/mozilla/twemoji-colr/releases/download/v0.7.0/Tw
 EMOJI_SHA256 = "6d90152ee0d29e82fe2a87793af5aa4b7ad13e6538360889e141e81ed299ee8e"
 EMOJI_SRC = CACHE / "Twemoji.Mozilla.ttf"
 LAUNCHER_PROC = r"^[A-Za-z]:\\.*Majestic Launcher\.exe"
+UPDATE_GLOBS = ("new-launcher-updater/pending/*.exe", "*updater*/pending/*.exe")
+UPDATE_ARGS = ("--updated", "/S", "--force-run")
+UPDATE_WAIT = 45
+LAUNCH_GRACE = 4
 
 STEAM_BAT_TEXT = "\r\n".join([
     "@echo off",
@@ -78,12 +81,13 @@ class SetupError(Exception):
 
 @dataclass
 class Config:
-    installer: str = ""
     extra_args: str = ""
+    proton: str = ""
 
 
 _current: subprocess.Popen | None = None
 _cancel = threading.Event()
+_proton_id = ""
 
 PACKAGE_MANAGERS = {
     "pacman": ("pacman", "-S", "--needed"),
@@ -146,16 +150,26 @@ def stop(force: bool = False) -> None:
                        capture_output=True)
 
 
+def use_config(cfg: Config) -> None:
+    global _proton_id
+    _proton_id = cfg.proton
+
+
+def _target() -> patch_proton.Target:
+    return patch_proton.target_for(_proton_id)
+
+
 def _proton_dir() -> Path:
-    if (PATCHED_PROTON / "proton").is_file() and is_proton_patched():
-        return PATCHED_PROTON
-    return STOCK_PROTON
+    tg = _target()
+    if (tg.patched / "proton").is_file() and is_proton_patched():
+        return tg.patched
+    return tg.source
 
 
 def proton_bin() -> Path:
     p = _proton_dir() / "proton"
     if not p.is_file():
-        raise SetupError(t("err.proton_missing"))
+        raise SetupError(t("err.proton_missing", name=p.parent.name))
     return p
 
 
@@ -232,14 +246,32 @@ def kill_launcher() -> None:
 
 
 def is_proton_patched() -> bool:
-    return patch_proton.is_patched(PATCHED_PROTON)
+    return patch_proton.is_patched(_target().patched)
 
 
 def create_patched_proton(cfg: Config, log: Log) -> None:
     try:
-        patch_proton.create_patched_copy(STOCK_PROTON, PATCHED_PROTON, log)
+        patch_proton.create_patched_copy(_target(), log)
     except patch_proton.PatchError as e:
         raise SetupError(str(e))
+
+
+def is_compat_tool_set() -> bool:
+    try:
+        return steam.compat_tool(APP_ID) == _target().name
+    except (OSError, steam.SteamConfigError):
+        return False
+
+
+def set_compat_tool(cfg: Config, log: Log) -> None:
+    if steam.steam_running():
+        raise SetupError(t("err.steam_running"))
+    name = _target().name
+    try:
+        steam.set_compat_tool(APP_ID, name)
+    except (OSError, steam.SteamConfigError) as e:
+        raise SetupError(t("err.steam_config", err=e))
+    log(t("gui.compat_set", name=name))
 
 
 def is_launcher_installed() -> bool:
@@ -301,10 +333,8 @@ def install_powershell(cfg: Config, log: Log) -> None:
 
 
 def install_launcher(cfg: Config, log: Log) -> None:
-    installer = Path(cfg.installer).expanduser() if cfg.installer else None
-    if installer is None or not installer.is_file():
-        installer = CACHE / "MajesticLauncherSetup.exe"
-        _download(SETUP_URL, installer, log)
+    installer = CACHE / "MajesticLauncherSetup.exe"
+    _download(SETUP_URL, installer, log)
     _run(["protontricks-launch", "--appid", str(APP_ID), installer], log,
          env=_env(cfg))
     log(t("log.wait_install"))
@@ -415,8 +445,10 @@ class Step:
 
 
 def steps(cfg: Config) -> list[Step]:
+    use_config(cfg)
     return [
         Step(t("step.proton"), is_proton_patched, create_patched_proton),
+        Step(t("step.compat"), is_compat_tool_set, set_compat_tool),
         Step(t("step.powershell"), is_powershell_installed, install_powershell),
         Step(t("step.launcher"), is_launcher_installed, install_launcher),
         Step(t("step.handler"), is_steam_handler_patched, patch_steam_handler),
@@ -436,6 +468,7 @@ def is_installed(cfg: Config) -> bool:
 def install(cfg: Config, log: Log,
             on_step: Callable[[int, str], None] | None = None,
             on_missing: Callable[[list[str], str, str], None] | None = None) -> None:
+    use_config(cfg)
     on_step = on_step or (lambda i, state: None)
     on_missing = on_missing or (lambda pkgs, command, manager: None)
     _cancel.clear()
@@ -520,11 +553,63 @@ def _watch_shim(log: Log, stop_evt: threading.Event) -> None:
                   state=t("diag.loaded" if loaded else "diag.not_loaded")))
 
 
-def launch(cfg: Config, log: Log) -> int:
-    exe = find_launcher()
-    if exe is None:
-        raise SetupError(t("err.launcher_missing"))
+def launcher_running() -> bool:
+    try:
+        r = subprocess.run(["pgrep", "-f", LAUNCHER_PROC], capture_output=True, env=_base_env())
+    except FileNotFoundError:
+        return False
+    return r.returncode == 0
+
+
+def _wait_until(cond: Callable[[], bool], seconds: float, step: float = 1.0) -> bool:
+    deadline = time.monotonic() + seconds
+    while not cond():
+        if _cancel.is_set() or time.monotonic() >= deadline:
+            return False
+        _cancel.wait(step)
+    return True
+
+
+def _update_signature(path: Path) -> str:
+    st = path.stat()
+    return f"{path.name}|{st.st_size}|{int(st.st_mtime)}"
+
+
+def find_pending_update() -> Path | None:
+    base = PFX / "drive_c/users/steamuser/AppData/Local"
+    if not base.is_dir():
+        return None
+    files = [f for pattern in UPDATE_GLOBS for f in base.glob(pattern) if f.is_file()]
+    if not files:
+        return None
+    newest = max(files, key=lambda f: f.stat().st_mtime)
+    try:
+        applied = UPDATE_STATE.read_text().strip()
+    except OSError:
+        applied = ""
+    return None if _update_signature(newest) == applied else newest
+
+
+def apply_pending_update(cfg: Config, log: Log) -> bool:
+    upd = find_pending_update()
+    if upd is None:
+        return False
+    log(t("log.update_found", name=upd.name))
+    kill_launcher()
+    _wait_until(lambda: not launcher_running(), 10)
+    code = _run(["protontricks-launch", "--appid", str(APP_ID), upd, *UPDATE_ARGS], log,
+                env=_env(cfg), check=False)
     STATE.mkdir(parents=True, exist_ok=True)
+    UPDATE_STATE.write_text(_update_signature(upd))
+    log(t("log.update_exit", code=code))
+    if _wait_until(launcher_running, UPDATE_WAIT):
+        log(t("log.update_started"))
+        return True
+    log(t("log.update_not_started"))
+    return False
+
+
+def _link_steam_drive(log: Log) -> None:
     s_drive = PFX / "dosdevices/s:"
     try:
         if s_drive.is_symlink() or s_drive.exists():
@@ -532,14 +617,66 @@ def launch(cfg: Config, log: Log) -> int:
         s_drive.symlink_to(STEAM)
     except OSError as e:
         log(t("gui.drive_s_fail", err=e))
-    cmd = ["protontricks-launch", "--appid", str(APP_ID), exe, *shlex.split(cfg.extra_args)]
-    env = _env(cfg, preload=True)
+
+
+def _launcher_cmd(cfg: Config) -> tuple[Path, list]:
+    exe = find_launcher()
+    if exe is None:
+        raise SetupError(t("err.launcher_missing"))
+    return exe, ["protontricks-launch", "--appid", str(APP_ID), exe, *shlex.split(cfg.extra_args)]
+
+
+def _spawn_detached(cfg: Config, log: Log, out) -> int | None:
+    exe, cmd = _launcher_cmd(cfg)
+    log("$ " + " ".join(shlex.quote(str(c)) for c in cmd))
+    try:
+        proc = subprocess.Popen(
+            [str(c) for c in cmd], env=_env(cfg, preload=True), cwd=exe.parent,
+            stdin=subprocess.DEVNULL, stdout=out, stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    except FileNotFoundError:
+        raise SetupError(t("err.cmd_not_found", cmd=cmd[0]))
+    try:
+        return proc.wait(timeout=LAUNCH_GRACE)
+    except subprocess.TimeoutExpired:
+        return None
+
+
+def _run_watched(cfg: Config, log: Log, updated: bool) -> int:
     stop_evt = threading.Event()
     threading.Thread(target=_watch_shim, args=(log, stop_evt), daemon=True).start()
+    code = 0
     try:
-        return _run(cmd, log, env=env, cwd=exe.parent, check=False)
+        while True:
+            if updated:
+                _wait_until(lambda: not launcher_running(), float("inf"), 2.0)
+            else:
+                exe, cmd = _launcher_cmd(cfg)
+                code = _run(cmd, log, env=_env(cfg, preload=True), cwd=exe.parent, check=False)
+            if _cancel.is_set():
+                break
+            updated = apply_pending_update(cfg, log)
+            if not updated:
+                break
+        return code
     finally:
         stop_evt.set()
+
+
+def launch(cfg: Config, log: Log, detach_out=None) -> int | None:
+    use_config(cfg)
+    if find_launcher() is None:
+        raise SetupError(t("err.launcher_missing"))
+    _cancel.clear()
+    STATE.mkdir(parents=True, exist_ok=True)
+    _link_steam_drive(log)
+    updated = apply_pending_update(cfg, log)
+    if detach_out is None:
+        return _run_watched(cfg, log, updated)
+    if updated:
+        return None
+    return _spawn_detached(cfg, log, detach_out)
 
 
 def _png_size(path: Path) -> tuple[int, int]:
