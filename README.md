@@ -135,7 +135,9 @@ nano ~/.local/share/Steam/steamapps/compatdata/271590/pfx/drive_c/users/steamuse
 
 ## 💬 Связь
 
-Если возникли проблемы, напишите в Discord: `qustsu`
+- Если возникли проблемы, напишите в Discord: `qustsu`
+- [Discord-сервер разработчика](https://discord.gg/BWVQUUsXE3)
+- [Youtube канал разработчика](https://www.youtube.com/@qustgta5)
 
 ## 🙏 Особая благодарность
 
