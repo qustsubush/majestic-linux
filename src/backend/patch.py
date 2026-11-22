@@ -12,11 +12,11 @@ import sys
 import threading
 import time
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from backend import patch_proton, steam
+from backend import debug, patch_proton, steam
 from i18n import t
 
 Log = Callable[[str], None]
@@ -83,6 +83,8 @@ class SetupError(Exception):
 class Config:
     extra_args: str = ""
     proton: str = ""
+    debug: dict = field(default_factory=dict)
+    debug_extra: str = ""
 
 
 _current: subprocess.Popen | None = None
@@ -184,6 +186,8 @@ def _env(cfg: Config, preload: bool = False) -> dict:
     if preload and SHIM_SO.is_file():
         old = env.get("LD_PRELOAD", "")
         env["LD_PRELOAD"] = f"{SHIM_SO}:{old}" if old else str(SHIM_SO)
+    if preload:
+        env.update(debug.resolve(cfg.debug, cfg.debug_extra).env)
     return env
 
 
@@ -623,7 +627,9 @@ def _launcher_cmd(cfg: Config) -> tuple[Path, list]:
     exe = find_launcher()
     if exe is None:
         raise SetupError(t("err.launcher_missing"))
-    return exe, ["protontricks-launch", "--appid", str(APP_ID), exe, *shlex.split(cfg.extra_args)]
+    wrappers = debug.resolve(cfg.debug, cfg.debug_extra).wrappers
+    return exe, [*wrappers, "protontricks-launch", "--appid", str(APP_ID), exe,
+                 *shlex.split(cfg.extra_args)]
 
 
 def _spawn_detached(cfg: Config, log: Log, out) -> int | None:
@@ -664,12 +670,37 @@ def _run_watched(cfg: Config, log: Log, updated: bool) -> int:
         stop_evt.set()
 
 
+def _log_debug_setup(cfg: Config, log: Log) -> None:
+    resolved = debug.resolve(cfg.debug, cfg.debug_extra)
+    for note in resolved.notes:
+        log(f"[debug] {note}")
+    for key, value in sorted(resolved.env.items()):
+        log(f"[debug] {key}={value}")
+    if resolved.wrappers:
+        log("[debug] wrappers: " + " ".join(resolved.wrappers))
+
+
+def run_diagnostics(log: Log) -> None:
+    debug.diagnose(PFX, log, env=_base_env())
+
+
+def open_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    try:
+        subprocess.Popen(["xdg-open", str(path)], env=_base_env(),
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
+    except FileNotFoundError:
+        raise SetupError(t("err.cmd_not_found", cmd="xdg-open"))
+
+
 def launch(cfg: Config, log: Log, detach_out=None) -> int | None:
     use_config(cfg)
     if find_launcher() is None:
         raise SetupError(t("err.launcher_missing"))
     _cancel.clear()
     STATE.mkdir(parents=True, exist_ok=True)
+    _log_debug_setup(cfg, log)
     _link_steam_drive(log)
     updated = apply_pending_update(cfg, log)
     if detach_out is None:

@@ -24,6 +24,7 @@ fi
   --hidden-import backend.patch_proton \
   --hidden-import backend.steam \
   --hidden-import backend.logs \
+  --hidden-import backend.debug \
   --hidden-import i18n \
   --hidden-import PySide6.QtSvg \
   "$ROOT/src/app/app.py"

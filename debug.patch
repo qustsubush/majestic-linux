@@ -1,0 +1,927 @@
+diff -ruN a/build b/build
+--- a/build	2026-11-22 17:01:49.218670936 +0000
++++ b/build	2026-11-22 17:02:45.363122854 +0000
+@@ -24,6 +24,7 @@
+   --hidden-import backend.patch_proton \
+   --hidden-import backend.steam \
+   --hidden-import backend.logs \
++  --hidden-import backend.debug \
+   --hidden-import i18n \
+   --hidden-import PySide6.QtSvg \
+   "$ROOT/src/app/app.py"
+diff -ruN a/src/app/app.py b/src/app/app.py
+--- a/src/app/app.py	2026-11-22 17:01:49.218529148 +0000
++++ b/src/app/app.py	2026-11-22 17:04:02.997008109 +0000
+@@ -17,7 +17,8 @@
+ from PySide6.QtWidgets import (
+     QAbstractButton, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
+     QLineEdit, QListWidget, QMainWindow, QPlainTextEdit,
+-    QMessageBox, QPushButton, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
++    QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStackedWidget,
++    QVBoxLayout, QWidget,
+ )
+ 
+ SRC_DIR = Path(__file__).resolve().parents[1]
+@@ -29,7 +30,7 @@
+ 
+ import backend.patch as core
+ import i18n
+-from backend import logs, patch_proton
++from backend import debug, logs, patch_proton
+ from i18n import t
+ 
+ APP_VERSION = "2.1.0"
+@@ -66,10 +67,12 @@
+ QListWidget::item {{ padding: 9px 12px; }}
+ QListWidget::item:selected {{ background: #2e2e2e; color: white; }}
+ QListWidget::item:hover {{ background: #262626; }}
+-QLineEdit, QPlainTextEdit {{
++QLineEdit, QPlainTextEdit, QSpinBox {{
+     background: #1b1b1b; border: 1px solid #3c3c3c; border-radius: 3px; padding: 5px;
+ }}
+-QLineEdit:focus {{ border-color: {ACCENT}; }}
++QLineEdit:focus, QSpinBox:focus {{ border-color: {ACCENT}; }}
++QScrollArea {{ border: none; background: transparent; }}
++#scrollInner {{ background: transparent; }}
+ #row {{ border-bottom: 1px solid #333333; }}
+ #muted {{ color: #8a8a8a; }}
+ #pageTitle {{ font-size: 16px; font-weight: bold; }}
+@@ -97,10 +100,27 @@
+         QMessageBox.warning(None, "Majestic Linux", str(e))
+ 
+ 
++def load_debug(s: QSettings) -> tuple[dict, str]:
++    values: dict = {}
++    for opt in debug.OPTIONS:
++        key = f"dbg/{opt.id}"
++        if opt.kind == "bool":
++            values[opt.id] = s.value(key, opt.default, type=bool)
++        elif opt.kind == "int":
++            values[opt.id] = s.value(key, opt.default, type=int)
++        else:
++            value = str(s.value(key, opt.default))
++            values[opt.id] = value if value in opt.choices else opt.default
++    return values, str(s.value("dbg/extra", ""))
++
++
+ def load_config(s: QSettings) -> core.Config:
++    values, extra = load_debug(s) if s.value("debug", False, type=bool) else ({}, "")
+     cfg = core.Config(
+         extra_args=str(s.value("extra_args", DEFAULT_ARGS)),
+         proton=str(s.value("proton", "")),
++        debug=values,
++        debug_extra=extra,
+     )
+     core.use_config(cfg)
+     return cfg
+@@ -401,6 +421,7 @@
+         self.cfg = cfg
+         self.bus = LogBus()
+         self.worker: Worker | None = None
++        self.diag_worker: Worker | None = None
+         self.setWindowTitle(t("debug.title"))
+         self.resize(780, 480)
+ 
+@@ -415,6 +436,8 @@
+         bar = QHBoxLayout()
+         self.stop_btn = QPushButton(t("debug.stop_prefix"))
+         self.stop_btn.clicked.connect(self.stop_prefix)
++        self.diag_btn = QPushButton(t("dbg.diag.btn"))
++        self.diag_btn.clicked.connect(self.run_diag)
+         self.copy_btn = QPushButton(t("btn.copy_log"))
+         self.copy_btn.clicked.connect(self.copy_log)
+         self.logs_btn = QPushButton(t("btn.open_logs"))
+@@ -422,6 +445,7 @@
+         self.status = QLabel(t("status.running"))
+         self.status.setObjectName("muted")
+         bar.addWidget(self.stop_btn)
++        bar.addWidget(self.diag_btn)
+         bar.addWidget(self.copy_btn)
+         bar.addWidget(self.logs_btn)
+         bar.addStretch(1)
+@@ -460,6 +484,20 @@
+         QApplication.clipboard().setText(self.view.toPlainText())
+         self.status.setText(t("status.log_copied"))
+ 
++    def run_diag(self):
++        if self.diag_worker and self.diag_worker.isRunning():
++            return
++
++        def job(w: Worker):
++            core.run_diagnostics(w.line.emit)
++            return 0
++
++        self.diag_worker = Worker(job)
++        self.diag_worker.line.connect(self.bus.push)
++        self.diag_worker.finished_with.connect(lambda _: self.diag_btn.setEnabled(True))
++        self.diag_btn.setEnabled(False)
++        self.diag_worker.start()
++
+     def _on_finished(self, code):
+         self.bus.push(t("gui.finished", code=code))
+         self.stop_btn.setEnabled(False)
+@@ -473,6 +511,8 @@
+                 return
+             core.stop(force=True)
+             self.worker.wait(3000)
++        if self.diag_worker and self.diag_worker.isRunning():
++            self.diag_worker.wait(3000)
+         self.bus.close()
+         if self in _debug_windows:
+             _debug_windows.remove(self)
+@@ -876,7 +916,166 @@
+         self.args.retranslate()
+ 
+ 
++class DebugPage(QWidget):
++    def __init__(self, settings: QSettings):
++        super().__init__()
++        self.settings = settings
++        self.bus = LogBus("diag-")
++        self.worker: Worker | None = None
++        self._rows: list[tuple[debug.Option, SettingRow]] = []
++        self._group_labels: dict[str, QLabel] = {}
++        self._combos: dict[str, tuple[debug.Option, QComboBox]] = {}
++
++        root = QVBoxLayout(self)
++        root.setContentsMargins(18, 14, 14, 14)
++        root.setSpacing(8)
++        self.title = QLabel()
++        self.title.setObjectName("pageTitle")
++        root.addWidget(self.title)
++        self.hint = QLabel()
++        self.hint.setObjectName("muted")
++        self.hint.setWordWrap(True)
++        root.addWidget(self.hint)
++
++        scroll = QScrollArea()
++        scroll.setWidgetResizable(True)
++        scroll.setFrameShape(QFrame.NoFrame)
++        inner = QWidget()
++        inner.setObjectName("scrollInner")
++        box = QVBoxLayout(inner)
++        box.setContentsMargins(0, 0, 10, 0)
++        box.setSpacing(0)
++        for group in debug.GROUPS:
++            label = QLabel()
++            label.setStyleSheet("font-weight: bold;")
++            box.addSpacing(10)
++            box.addWidget(label)
++            self._group_labels[group] = label
++            for opt in debug.OPTIONS:
++                if opt.group != group:
++                    continue
++                row = SettingRow(self._make_widget(opt))
++                box.addWidget(row)
++                self._rows.append((opt, row))
++
++        self.extra_edit = QPlainTextEdit(str(settings.value("dbg/extra", "")))
++        self.extra_edit.setFont(QFont("monospace", 9))
++        self.extra_edit.setFixedHeight(76)
++        self.extra_edit.setMinimumWidth(300)
++        self.extra_edit.textChanged.connect(
++            lambda: settings.setValue("dbg/extra", self.extra_edit.toPlainText()))
++        self.extra_row = SettingRow(self.extra_edit)
++        box.addSpacing(10)
++        box.addWidget(self.extra_row)
++        box.addStretch(1)
++        scroll.setWidget(inner)
++        root.addWidget(scroll, 3)
++
++        bar = QHBoxLayout()
++        self.diag_btn = QPushButton()
++        self.diag_btn.clicked.connect(self.run_diag)
++        self.folder_btn = QPushButton()
++        self.folder_btn.clicked.connect(self.open_metrics)
++        self.copy_btn = QPushButton()
++        self.copy_btn.clicked.connect(self.copy_log)
++        self.status = QLabel()
++        self.status.setObjectName("muted")
++        bar.addWidget(self.diag_btn)
++        bar.addWidget(self.folder_btn)
++        bar.addWidget(self.copy_btn)
++        bar.addStretch(1)
++        bar.addWidget(self.status)
++        root.addLayout(bar)
++
++        self.log = new_log_view()
++        self.log.setMinimumHeight(110)
++        self.bus.line.connect(self.log.appendPlainText)
++        root.addWidget(self.log, 2)
++
++        self.retranslate()
++
++    def _make_widget(self, opt: debug.Option) -> QWidget:
++        key = f"dbg/{opt.id}"
++        if opt.kind == "bool":
++            switch = ToggleSwitch(self.settings.value(key, opt.default, type=bool))
++            switch.toggled.connect(lambda v, k=key: self.settings.setValue(k, v))
++            return switch
++        if opt.kind == "int":
++            spin = QSpinBox()
++            spin.setRange(0, 360)
++            spin.setFixedWidth(90)
++            spin.setValue(self.settings.value(key, opt.default, type=int))
++            spin.valueChanged.connect(lambda v, k=key: self.settings.setValue(k, v))
++            return spin
++        combo = QComboBox()
++        combo.setMinimumWidth(190)
++        combo.currentIndexChanged.connect(
++            lambda _, c=combo, k=key: self.settings.setValue(k, c.currentData()))
++        self._combos[opt.id] = (opt, combo)
++        return combo
++
++    def _fill_combo(self, opt: debug.Option, combo: QComboBox):
++        stored = str(self.settings.value(f"dbg/{opt.id}", opt.default))
++        combo.blockSignals(True)
++        combo.clear()
++        for choice in opt.choices:
++            combo.addItem(t(f"dbg.{opt.id}.{choice}"), choice)
++        index = combo.findData(stored)
++        combo.setCurrentIndex(index if index >= 0 else combo.findData(opt.default))
++        combo.blockSignals(False)
++
++    def retranslate(self):
++        self.title.setText(t("nav.debug"))
++        self.hint.setText(t("dbg.hint"))
++        for group, label in self._group_labels.items():
++            label.setText(t(f"dbg.group.{group}"))
++        for opt, row in self._rows:
++            row.set_texts(t(f"dbg.{opt.id}.title"), t(f"dbg.{opt.id}.desc"))
++        for opt, combo in self._combos.values():
++            self._fill_combo(opt, combo)
++        self.extra_row.set_texts(t("dbg.extra.title"), t("dbg.extra.desc"))
++        self.extra_edit.setPlaceholderText(t("dbg.extra.placeholder"))
++        self.diag_btn.setText(t("dbg.diag.btn"))
++        self.folder_btn.setText(t("dbg.metrics.btn"))
++        self.copy_btn.setText(t("btn.copy_log"))
++        self.log.setPlaceholderText(t("dbg.diag.placeholder"))
++
++    def run_diag(self):
++        if self.worker and self.worker.isRunning():
++            return
++
++        def job(w: Worker):
++            core.run_diagnostics(w.line.emit)
++            return 0
++
++        self.log.clear()
++        self.bus.begin()
++        self.worker = Worker(job)
++        self.worker.line.connect(self.bus.push)
++        self.worker.finished_with.connect(self._diag_done)
++        self.diag_btn.setEnabled(False)
++        self.status.setText(t("dbg.diag.running"))
++        self.worker.start()
++
++    def _diag_done(self, code):
++        self.worker.wait()
++        self.diag_btn.setEnabled(True)
++        self.status.setText(t("dbg.diag.done"))
++
++    def open_metrics(self):
++        try:
++            core.open_dir(debug.MANGOHUD_DIR)
++        except core.SetupError as e:
++            QMessageBox.warning(self, "Majestic Linux", str(e))
++
++    def copy_log(self):
++        QApplication.clipboard().setText(self.log.toPlainText())
++        self.status.setText(t("status.log_copied"))
++
++
+ class AddPage(QWidget):
++    debug_toggled = Signal(bool)
++
+     def __init__(self, settings: QSettings):
+         super().__init__()
+         self._shortcut_msg: tuple[str, dict] | None = None
+@@ -889,7 +1088,8 @@
+         root.addSpacing(8)
+ 
+         self.debug_switch = ToggleSwitch(settings.value("debug", False, type=bool))
+-        self.debug_switch.toggled.connect(lambda v: settings.setValue("debug", v))
++        self.debug_switch.toggled.connect(
++            lambda v: (settings.setValue("debug", v), self.debug_toggled.emit(v)))
+         self.debug_row = SettingRow(self.debug_switch)
+         root.addWidget(self.debug_row)
+ 
+@@ -956,7 +1156,9 @@
+         self.gh.setText(t("about.github"))
+ 
+ 
+-NAV_KEYS = ("nav.general", "nav.install", "nav.settings", "nav.additional", "nav.about")
++NAV_KEYS = ("nav.general", "nav.install", "nav.settings", "nav.additional", "nav.debug",
++            "nav.about")
++DEBUG_ROW = NAV_KEYS.index("nav.debug")
+ 
+ 
+ class MainWindow(QMainWindow):
+@@ -1002,8 +1204,10 @@
+         self.general = GeneralPage(self.settings)
+         self.installer = InstallPage(self.settings)
+         self.settings_page = SettingsPage(self.settings)
++        self.add_page = AddPage(self.settings)
++        self.debug_page = DebugPage(self.settings)
+         self.pages = [self.general, self.installer, self.settings_page,
+-                      AddPage(self.settings), AboutPage()]
++                      self.add_page, self.debug_page, AboutPage()]
+         for page in self.pages:
+             self.stack.addWidget(page)
+         self.settings_page.language_changed.connect(self.apply_language)
+@@ -1014,6 +1218,8 @@
+         self.installer.running_changed.connect(self.settings_page.set_locked)
+         outer.addWidget(self.stack, 1)
+ 
++        self.add_page.debug_toggled.connect(self.set_debug_visible)
++        self.set_debug_visible(self.settings.value("debug", False, type=bool))
+         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
+         self.nav.setCurrentRow(0)
+ 
+@@ -1023,10 +1229,19 @@
+             core.stop(force=True)
+             for w in workers:
+                 w.wait(3000)
++        diag = self.debug_page.worker
++        if diag and diag.isRunning():
++            diag.wait(3000)
+         self.general.bus.close()
+         self.installer.bus.close()
++        self.debug_page.bus.close()
+         super().closeEvent(event)
+ 
++    def set_debug_visible(self, visible: bool):
++        self.nav.item(DEBUG_ROW).setHidden(not visible)
++        if not visible and self.nav.currentRow() == DEBUG_ROW:
++            self.nav.setCurrentRow(DEBUG_ROW - 1)
++
+     def on_proton_changed(self):
+         self.general.refresh()
+         self.nav.setCurrentRow(1)
+diff -ruN a/src/app/i18n.py b/src/app/i18n.py
+--- a/src/app/i18n.py	2026-11-22 17:01:49.218563739 +0000
++++ b/src/app/i18n.py	2026-11-22 17:03:07.418552775 +0000
+@@ -117,6 +117,47 @@
+         "debug.stop_prefix": "Stop prefix",
+         "debug.finished": "Finished",
+         "debug.confirm_close": "The launcher is still running. Stop the prefix and close the window?",
++        "nav.debug": "Debug",
++        "dbg.hint": "These options apply only while debug mode is on. Changes take effect on the next launch.",
++        "dbg.group.metrics": "Metrics",
++        "dbg.group.logs": "Logs",
++        "dbg.group.wine": "Wine and Proton",
++        "dbg.group.gpu": "GPU",
++        "dbg.group.process": "Process",
++        "dbg.mangohud.title": "MangoHud overlay",
++        "dbg.mangohud.desc": "Shows FPS, frametime, CPU and GPU load and throttling in the game, and writes a CSV log to ~/.local/state/majesticrplinux/mangohud. Needs mangohud installed.",
++        "dbg.dxvk_hud.title": "DXVK HUD",
++        "dbg.dxvk_hud.desc": "Built-in DXVK overlay with the GPU name, D3D feature level, FPS and frametimes. If it does not appear, the game is not running on DXVK.",
++        "dbg.fps_limit.title": "FPS limit (DXVK)",
++        "dbg.fps_limit.desc": "Caps the frame rate through DXVK. A steady frametime often feels smoother than a high but uneven FPS. 0 means off.",
++        "dbg.loaddll.title": "Log loaded DLLs",
++        "dbg.loaddll.desc": "Writes every loaded DLL to the log (WINEDEBUG=+loaddll). Shows whether DXVK or wined3d is loaded. The log gets large.",
++        "dbg.dxvk_log.title": "DXVK log",
++        "dbg.dxvk_log.desc": "Writes DXVK logs (device selection, shader compilation) to ~/.local/state/majesticrplinux/dxvk.",
++        "dbg.winedebug_off.title": "Silence Wine output",
++        "dbg.winedebug_off.desc": "Sets WINEDEBUG=-all. Removes fixme and err spam that gets piped into the log, which costs CPU.",
++        "dbg.sync.title": "Wine sync mode",
++        "dbg.sync.desc": "Forces ntsync, fsync or esync. Protontricks starts Wine without the Proton script, so sync may be off by default.",
++        "dbg.sync.auto": "Auto (do not set)",
++        "dbg.sync.ntsync": "ntsync",
++        "dbg.sync.fsync": "fsync",
++        "dbg.sync.esync": "esync",
++        "dbg.force_dxvk.title": "Force DXVK",
++        "dbg.force_dxvk.desc": "Sets WINEDLLOVERRIDES for d3d11, d3d10core, d3d9 and dxgi so Wine loads DXVK from the prefix instead of wined3d.",
++        "dbg.prime.title": "NVIDIA PRIME offload",
++        "dbg.prime.desc": "Runs the game on the discrete NVIDIA GPU on hybrid laptops.",
++        "dbg.shader_cache.title": "NVIDIA shader cache",
++        "dbg.shader_cache.desc": "Enables the driver shader cache with a 10 GB limit and no cleanup, to reduce stutter after the first run.",
++        "dbg.gamemode.title": "Gamemode",
++        "dbg.gamemode.desc": "Runs the launcher through gamemoderun to switch the CPU governor while it is running.",
++        "dbg.extra.title": "Custom environment variables",
++        "dbg.extra.desc": "One KEY=VALUE per line, applied last. WINEDLLOVERRIDES and WINEDEBUG are merged with the values above.",
++        "dbg.extra.placeholder": "KEY=VALUE",
++        "dbg.diag.btn": "Run diagnostics",
++        "dbg.metrics.btn": "Open metrics folder",
++        "dbg.diag.placeholder": "Start the game, then run diagnostics: renderer, sync mode, environment, GPU, throttling, power and memory.",
++        "dbg.diag.running": "Diagnostics running…",
++        "dbg.diag.done": "Diagnostics finished",
+     },
+     "ru": {
+         "err.cancelled": "Установка отменена.",
+@@ -232,6 +273,47 @@
+         "debug.stop_prefix": "Остановить префикс",
+         "debug.finished": "Завершено",
+         "debug.confirm_close": "Лаунчер ещё работает. Остановить префикс и закрыть окно?",
++        "nav.debug": "Отладка",
++        "dbg.hint": "Эти опции работают только при включённом режиме отладки. Изменения применяются при следующем запуске.",
++        "dbg.group.metrics": "Метрики",
++        "dbg.group.logs": "Логи",
++        "dbg.group.wine": "Wine и Proton",
++        "dbg.group.gpu": "Видеокарта",
++        "dbg.group.process": "Процесс",
++        "dbg.mangohud.title": "Оверлей MangoHud",
++        "dbg.mangohud.desc": "Показывает в игре FPS, frametime, нагрузку CPU и GPU и троттлинг, а также пишет CSV-лог в ~/.local/state/majesticrplinux/mangohud. Нужен установленный mangohud.",
++        "dbg.dxvk_hud.title": "DXVK HUD",
++        "dbg.dxvk_hud.desc": "Встроенный оверлей DXVK: имя видеокарты, уровень D3D, FPS и frametime. Если он не появился, игра работает не на DXVK.",
++        "dbg.fps_limit.title": "Лимит FPS (DXVK)",
++        "dbg.fps_limit.desc": "Ограничивает частоту кадров через DXVK. Ровный frametime часто ощущается плавнее, чем высокий, но скачущий FPS. 0 означает выключено.",
++        "dbg.loaddll.title": "Лог загруженных DLL",
++        "dbg.loaddll.desc": "Пишет в лог каждую загруженную DLL (WINEDEBUG=+loaddll). Видно, что загрузилось: DXVK или wined3d. Лог получается большим.",
++        "dbg.dxvk_log.title": "Лог DXVK",
++        "dbg.dxvk_log.desc": "Пишет логи DXVK (выбор устройства, компиляция шейдеров) в ~/.local/state/majesticrplinux/dxvk.",
++        "dbg.winedebug_off.title": "Заглушить вывод Wine",
++        "dbg.winedebug_off.desc": "Ставит WINEDEBUG=-all. Убирает поток fixme и err, который идёт в лог и тратит CPU.",
++        "dbg.sync.title": "Режим синхронизации Wine",
++        "dbg.sync.desc": "Принудительно включает ntsync, fsync или esync. Protontricks запускает Wine без скрипта Proton, поэтому синхронизация может быть выключена.",
++        "dbg.sync.auto": "Авто (не задавать)",
++        "dbg.sync.ntsync": "ntsync",
++        "dbg.sync.fsync": "fsync",
++        "dbg.sync.esync": "esync",
++        "dbg.force_dxvk.title": "Принудительно DXVK",
++        "dbg.force_dxvk.desc": "Задаёт WINEDLLOVERRIDES для d3d11, d3d10core, d3d9 и dxgi, чтобы Wine грузил DXVK из префикса, а не wined3d.",
++        "dbg.prime.title": "NVIDIA PRIME offload",
++        "dbg.prime.desc": "Запускает игру на дискретной видеокарте NVIDIA на гибридных ноутбуках.",
++        "dbg.shader_cache.title": "Шейдерный кэш NVIDIA",
++        "dbg.shader_cache.desc": "Включает шейдерный кэш драйвера с лимитом 10 ГБ и без очистки, чтобы уменьшить статтеры после первого запуска.",
++        "dbg.gamemode.title": "Gamemode",
++        "dbg.gamemode.desc": "Запускает лаунчер через gamemoderun, чтобы на время работы переключить governor процессора.",
++        "dbg.extra.title": "Свои переменные окружения",
++        "dbg.extra.desc": "По одной KEY=VALUE на строку, применяются последними. WINEDLLOVERRIDES и WINEDEBUG объединяются со значениями выше.",
++        "dbg.extra.placeholder": "KEY=VALUE",
++        "dbg.diag.btn": "Запустить диагностику",
++        "dbg.metrics.btn": "Папка с метриками",
++        "dbg.diag.placeholder": "Запусти игру и затем диагностику: рендерер, режим синхронизации, окружение, видеокарта, троттлинг, питание и память.",
++        "dbg.diag.running": "Диагностика идёт…",
++        "dbg.diag.done": "Диагностика завершена",
+     },
+ }
+ 
+diff -ruN a/src/backend/debug.py b/src/backend/debug.py
+--- a/src/backend/debug.py	1970-01-01 00:00:00.000000000 +0000
++++ b/src/backend/debug.py	2026-11-22 17:02:18.838506207 +0000
+@@ -0,0 +1,380 @@
++from __future__ import annotations
++
++import os
++import re
++import shutil
++import subprocess
++from dataclasses import dataclass, field
++from pathlib import Path
++from typing import Callable
++
++Log = Callable[[str], None]
++
++STATE = Path.home() / ".local/state/majesticrplinux"
++MANGOHUD_DIR = STATE / "mangohud"
++DXVK_LOG_DIR = STATE / "dxvk"
++
++MANGOHUD_FIELDS = (
++    "fps", "frametime", "frame_timing", "gpu_stats", "gpu_temp", "cpu_stats",
++    "cpu_temp", "vram", "ram", "throttling_status",
++)
++DXVK_HUD_FIELDS = ("devinfo", "fps", "frametimes", "gpuload", "memory", "version", "api")
++DXVK_OVERRIDES = "d3d11,d3d10core,d3d9,dxgi=n,b"
++PRIME_ENV = {
++    "__NV_PRIME_RENDER_OFFLOAD": "1",
++    "__GLX_VENDOR_LIBRARY_NAME": "nvidia",
++    "__VK_LAYER_NV_optimus": "NVIDIA_only",
++}
++SHADER_CACHE_ENV = {
++    "__GL_SHADER_DISK_CACHE": "1",
++    "__GL_SHADER_DISK_CACHE_SKIP_CLEANUP": "1",
++    "__GL_SHADER_DISK_CACHE_SIZE": "10737418240",
++}
++SYNC_ENV = {"ntsync": "WINENTSYNC", "fsync": "WINEFSYNC", "esync": "WINEESYNC"}
++MERGE_SEPARATORS = {"WINEDLLOVERRIDES": ";", "WINEDEBUG": ","}
++ENV_KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
++
++WATCHED_ENV = (
++    "WINEDEBUG", "WINEDLLOVERRIDES", "WINEESYNC", "WINEFSYNC", "WINENTSYNC",
++    "DXVK_HUD", "DXVK_FRAME_RATE", "DXVK_LOG_LEVEL", "MANGOHUD",
++    "__NV_PRIME_RENDER_OFFLOAD", "__GLX_VENDOR_LIBRARY_NAME", "__VK_LAYER_NV_optimus",
++    "LD_PRELOAD", "LC_ALL",
++)
++GRAPHICS_MODULES = (
++    "d3d11.dll", "d3d10core.dll", "dxgi.dll", "d3d9.dll", "wined3d.dll",
++    "winevulkan.dll", "vulkan-1.dll",
++)
++GAME_MARKERS = ("gta5", "playgtav")
++MAX_GAME_PROCS = 3
++
++
++@dataclass(frozen=True)
++class Option:
++    id: str
++    kind: str
++    group: str
++    default: object = False
++    choices: tuple = ()
++
++
++OPTIONS = (
++    Option("mangohud", "bool", "metrics"),
++    Option("dxvk_hud", "bool", "metrics"),
++    Option("fps_limit", "int", "metrics", 0),
++    Option("loaddll", "bool", "logs"),
++    Option("dxvk_log", "bool", "logs"),
++    Option("winedebug_off", "bool", "logs"),
++    Option("sync", "choice", "wine", "auto", ("auto", "ntsync", "fsync", "esync")),
++    Option("force_dxvk", "bool", "wine"),
++    Option("prime", "bool", "gpu"),
++    Option("shader_cache", "bool", "gpu"),
++    Option("gamemode", "bool", "process"),
++)
++GROUPS = ("metrics", "logs", "wine", "gpu", "process")
++
++
++@dataclass
++class Resolved:
++    env: dict[str, str] = field(default_factory=dict)
++    wrappers: list[str] = field(default_factory=list)
++    notes: list[str] = field(default_factory=list)
++
++
++def _ensure(path: Path) -> None:
++    try:
++        path.mkdir(parents=True, exist_ok=True)
++    except OSError:
++        pass
++
++
++def _put(env: dict[str, str], key: str, value: str) -> None:
++    sep = MERGE_SEPARATORS.get(key)
++    if sep and env.get(key):
++        env[key] = env[key] + sep + value
++    else:
++        env[key] = value
++
++
++def resolve(values: dict, extra: str = "") -> Resolved:
++    out = Resolved()
++    env = out.env
++
++    flags = []
++    if values.get("winedebug_off"):
++        flags.append("-all")
++    if values.get("loaddll"):
++        flags.append("+loaddll")
++    if flags:
++        env["WINEDEBUG"] = ",".join(flags)
++
++    if values.get("mangohud"):
++        _ensure(MANGOHUD_DIR)
++        env["MANGOHUD"] = "1"
++        env["MANGOHUD_CONFIG"] = ",".join(
++            (*MANGOHUD_FIELDS, f"output_folder={MANGOHUD_DIR}", "autostart_log=5"))
++        if shutil.which("mangohud") is None:
++            out.notes.append("mangohud was not found in PATH, the overlay may not appear")
++
++    if values.get("dxvk_hud"):
++        env["DXVK_HUD"] = ",".join(DXVK_HUD_FIELDS)
++
++    limit = int(values.get("fps_limit") or 0)
++    if limit > 0:
++        env["DXVK_FRAME_RATE"] = str(limit)
++
++    if values.get("dxvk_log"):
++        _ensure(DXVK_LOG_DIR)
++        env["DXVK_LOG_LEVEL"] = "info"
++        env["DXVK_LOG_PATH"] = str(DXVK_LOG_DIR)
++
++    sync = values.get("sync", "auto")
++    if sync in SYNC_ENV:
++        env[SYNC_ENV[sync]] = "1"
++        if sync == "ntsync" and not Path("/dev/ntsync").exists():
++            out.notes.append("/dev/ntsync is missing, load the ntsync kernel module")
++
++    if values.get("force_dxvk"):
++        _put(env, "WINEDLLOVERRIDES", DXVK_OVERRIDES)
++
++    if values.get("prime"):
++        env.update(PRIME_ENV)
++
++    if values.get("shader_cache"):
++        env.update(SHADER_CACHE_ENV)
++
++    if values.get("gamemode"):
++        if shutil.which("gamemoderun"):
++            out.wrappers.append("gamemoderun")
++        else:
++            out.notes.append("gamemoderun was not found in PATH, gamemode is skipped")
++
++    for raw in extra.splitlines():
++        line = raw.strip()
++        if not line or line.startswith("#") or "=" not in line:
++            continue
++        key, _, value = line.partition("=")
++        key = key.strip()
++        if not ENV_KEY.fullmatch(key):
++            out.notes.append(f"ignored custom line: {line}")
++            continue
++        _put(env, key, value.strip().strip('"').strip("'"))
++
++    return out
++
++
++def _read(path: Path) -> bytes | None:
++    try:
++        return path.read_bytes()
++    except OSError:
++        return None
++
++
++def _environ(pid: int) -> dict[str, str]:
++    raw = _read(Path("/proc") / str(pid) / "environ")
++    result: dict[str, str] = {}
++    if raw is None:
++        return result
++    for item in raw.split(b"\0"):
++        key, sep, value = item.partition(b"=")
++        if sep:
++            result[key.decode(errors="replace")] = value.decode(errors="replace")
++    return result
++
++
++def _game_processes(pfx: Path) -> list[tuple[int, str]]:
++    found: list[tuple[int, str]] = []
++    try:
++        entries = list(Path("/proc").iterdir())
++    except OSError:
++        return found
++    for entry in entries:
++        if not entry.name.isdigit():
++            continue
++        raw = _read(entry / "cmdline")
++        if not raw:
++            continue
++        text = raw.replace(b"\0", b" ").decode(errors="replace").strip()
++        low = text.lower()
++        if not any(m in low for m in GAME_MARKERS) or "--type=" in low:
++            continue
++        if _environ(int(entry.name)).get("WINEPREFIX") != str(pfx):
++            continue
++        found.append((int(entry.name), text))
++    return found[:MAX_GAME_PROCS]
++
++
++def _graphics_modules(pid: int) -> list[str]:
++    raw = _read(Path("/proc") / str(pid) / "maps")
++    paths: set[str] = set()
++    if raw is None:
++        return []
++    for line in raw.decode(errors="replace").splitlines():
++        parts = line.split(None, 5)
++        if len(parts) < 6:
++            continue
++        path = parts[5].replace(" (deleted)", "")
++        if Path(path).name.lower() in GRAPHICS_MODULES:
++            paths.add(path)
++    return sorted(paths)
++
++
++def _renderer_verdict(modules: list[str]) -> str:
++    names = {Path(m).name.lower() for m in modules}
++    d3d11 = [m for m in modules if Path(m).name.lower() == "d3d11.dll"]
++    if any("drive_c" in m for m in d3d11):
++        return "DXVK (d3d11.dll is loaded from the prefix)"
++    if "wined3d.dll" in names:
++        return "wined3d (OpenGL), DXVK is NOT used"
++    if d3d11:
++        return "d3d11.dll is loaded from Wine, renderer is unclear"
++    return "no d3d11 module found yet, start the game first"
++
++
++def _fd_counts(pid: int) -> dict[str, int]:
++    counts = {"total": 0, "ntsync": 0, "eventfd": 0}
++    try:
++        fds = list((Path("/proc") / str(pid) / "fd").iterdir())
++    except OSError:
++        return counts
++    for fd in fds:
++        try:
++            target = os.readlink(fd)
++        except OSError:
++            continue
++        counts["total"] += 1
++        if "ntsync" in target:
++            counts["ntsync"] += 1
++        elif "eventfd" in target:
++            counts["eventfd"] += 1
++    return counts
++
++
++def _status_fields(pid: int) -> str:
++    raw = _read(Path("/proc") / str(pid) / "status")
++    if raw is None:
++        return "?"
++    wanted = {}
++    for line in raw.decode(errors="replace").splitlines():
++        key, _, value = line.partition(":")
++        if key in ("Threads", "VmRSS"):
++            wanted[key] = value.strip()
++    return ", ".join(f"{k}={v}" for k, v in wanted.items()) or "?"
++
++
++def _run(cmd: list[str], env: dict | None, timeout: float = 8) -> str | None:
++    try:
++        r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
++                           timeout=timeout, env=env)
++    except (OSError, subprocess.TimeoutExpired):
++        return None
++    return ((r.stdout or "") + (r.stderr or "")).strip()
++
++
++def _first_line(path: str) -> str | None:
++    raw = _read(Path(path))
++    if raw is None:
++        return None
++    return raw.decode(errors="replace").strip()
++
++
++def _meminfo() -> dict[str, int]:
++    raw = _read(Path("/proc/meminfo"))
++    result: dict[str, int] = {}
++    if raw is None:
++        return result
++    for line in raw.decode(errors="replace").splitlines():
++        key, _, value = line.partition(":")
++        digits = re.match(r"\s*(\d+)", value)
++        if digits:
++            result[key] = int(digits.group(1))
++    return result
++
++
++def _section(log: Log, title: str) -> None:
++    log("")
++    log(f"== {title} ==")
++
++
++def _diagnose_game(pfx: Path, log: Log) -> None:
++    _section(log, "Game processes")
++    procs = _game_processes(pfx)
++    if not procs:
++        log("no GTA5.exe / PlayGTAV.exe process found in the prefix, start the game first")
++        return
++    for pid, cmd in procs:
++        log(f"pid {pid}: {cmd[-100:]}")
++        log(f"  {_status_fields(pid)}")
++        env = _environ(pid)
++        for key in WATCHED_ENV:
++            log(f"  {key}={env.get(key, '(unset)')}")
++        modules = _graphics_modules(pid)
++        for module in modules:
++            log(f"  module: {module}")
++        log(f"  renderer: {_renderer_verdict(modules)}")
++        counts = _fd_counts(pid)
++        log(f"  fds: total={counts['total']} ntsync={counts['ntsync']} eventfd={counts['eventfd']}")
++        if counts["ntsync"]:
++            log("  sync: ntsync is active")
++        elif counts["eventfd"] > 100:
++            log("  sync: esync looks active")
++        else:
++            log("  sync: neither ntsync nor esync fds found (fsync or wineserver-based sync)")
++
++
++def _diagnose_gpu(env: dict | None, log: Log) -> None:
++    _section(log, "NVIDIA GPU")
++    if shutil.which("nvidia-smi") is None:
++        log("nvidia-smi was not found")
++        return
++    query = _run(["nvidia-smi", "--query-gpu=name,pstate,temperature.gpu,utilization.gpu,"
++                  "clocks.sm,clocks.max.sm,power.draw,power.limit,memory.used,memory.total",
++                  "--format=csv,noheader"], env)
++    log(query or "nvidia-smi query failed")
++    perf = _run(["nvidia-smi", "-q", "-d", "PERFORMANCE"], env)
++    if perf:
++        active = []
++        for line in perf.splitlines():
++            name, sep, value = line.partition(":")
++            if sep and value.strip() == "Active":
++                active.append(name.strip())
++        log("active clock event reasons: " + (", ".join(active) if active else "none"))
++    table = _run(["nvidia-smi"], env)
++    if table:
++        lines = [ln for ln in table.splitlines() if any(m in ln.lower() for m in GAME_MARKERS)]
++        if lines:
++            for ln in lines:
++                log(ln.strip())
++        else:
++            log("the game is not listed among NVIDIA processes (it may be running on the iGPU)")
++
++
++def _diagnose_system(env: dict | None, log: Log) -> None:
++    _section(log, "System")
++    log(f"/dev/ntsync: {'present' if Path('/dev/ntsync').exists() else 'missing'}")
++    governor = _first_line("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
++    epp = _first_line("/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference")
++    log(f"cpu governor: {governor or '?'}, energy preference: {epp or '?'}")
++    if shutil.which("powerprofilesctl"):
++        log(f"power profile: {_run(['powerprofilesctl', 'get'], env) or '?'}")
++    for supply in sorted(Path("/sys/class/power_supply").glob("*")):
++        if _first_line(str(supply / "type")) == "Mains":
++            online = _first_line(str(supply / "online"))
++            log(f"ac adapter {supply.name}: {'connected' if online == '1' else 'not connected'}")
++    mem = _meminfo()
++    if mem:
++        swap_used = mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)
++        log(f"ram: available {mem.get('MemAvailable', 0) // 1024} MiB of "
++            f"{mem.get('MemTotal', 0) // 1024} MiB, swap used {swap_used // 1024} MiB")
++    for tool in ("mangohud", "gamemoderun", "nvidia-smi"):
++        log(f"{tool}: {shutil.which(tool) or 'not found'}")
++    if shutil.which("gamemoded"):
++        log(f"gamemode: {_run(['gamemoded', '-s'], env) or '?'}")
++
++
++def diagnose(pfx: Path, log: Log, env: dict | None = None) -> None:
++    log("Diagnostics started")
++    _diagnose_game(pfx, log)
++    _diagnose_gpu(env, log)
++    _diagnose_system(env, log)
++    log("")
++    log("Diagnostics finished")
+diff -ruN a/src/backend/patch.py b/src/backend/patch.py
+--- a/src/backend/patch.py	2026-11-22 17:01:49.218584465 +0000
++++ b/src/backend/patch.py	2026-11-22 17:02:45.362970170 +0000
+@@ -12,11 +12,11 @@
+ import threading
+ import time
+ import urllib.request
+-from dataclasses import dataclass
++from dataclasses import dataclass, field
+ from pathlib import Path
+ from typing import Callable
+ 
+-from backend import patch_proton, steam
++from backend import debug, patch_proton, steam
+ from i18n import t
+ 
+ Log = Callable[[str], None]
+@@ -83,6 +83,8 @@
+ class Config:
+     extra_args: str = ""
+     proton: str = ""
++    debug: dict = field(default_factory=dict)
++    debug_extra: str = ""
+ 
+ 
+ _current: subprocess.Popen | None = None
+@@ -184,6 +186,8 @@
+     if preload and SHIM_SO.is_file():
+         old = env.get("LD_PRELOAD", "")
+         env["LD_PRELOAD"] = f"{SHIM_SO}:{old}" if old else str(SHIM_SO)
++    if preload:
++        env.update(debug.resolve(cfg.debug, cfg.debug_extra).env)
+     return env
+ 
+ 
+@@ -623,7 +627,9 @@
+     exe = find_launcher()
+     if exe is None:
+         raise SetupError(t("err.launcher_missing"))
+-    return exe, ["protontricks-launch", "--appid", str(APP_ID), exe, *shlex.split(cfg.extra_args)]
++    wrappers = debug.resolve(cfg.debug, cfg.debug_extra).wrappers
++    return exe, [*wrappers, "protontricks-launch", "--appid", str(APP_ID), exe,
++                 *shlex.split(cfg.extra_args)]
+ 
+ 
+ def _spawn_detached(cfg: Config, log: Log, out) -> int | None:
+@@ -664,12 +670,37 @@
+         stop_evt.set()
+ 
+ 
++def _log_debug_setup(cfg: Config, log: Log) -> None:
++    resolved = debug.resolve(cfg.debug, cfg.debug_extra)
++    for note in resolved.notes:
++        log(f"[debug] {note}")
++    for key, value in sorted(resolved.env.items()):
++        log(f"[debug] {key}={value}")
++    if resolved.wrappers:
++        log("[debug] wrappers: " + " ".join(resolved.wrappers))
++
++
++def run_diagnostics(log: Log) -> None:
++    debug.diagnose(PFX, log, env=_base_env())
++
++
++def open_dir(path: Path) -> None:
++    path.mkdir(parents=True, exist_ok=True)
++    try:
++        subprocess.Popen(["xdg-open", str(path)], env=_base_env(),
++                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
++                         start_new_session=True)
++    except FileNotFoundError:
++        raise SetupError(t("err.cmd_not_found", cmd="xdg-open"))
++
++
+ def launch(cfg: Config, log: Log, detach_out=None) -> int | None:
+     use_config(cfg)
+     if find_launcher() is None:
+         raise SetupError(t("err.launcher_missing"))
+     _cancel.clear()
+     STATE.mkdir(parents=True, exist_ok=True)
++    _log_debug_setup(cfg, log)
+     _link_steam_drive(log)
+     updated = apply_pending_update(cfg, log)
+     if detach_out is None:

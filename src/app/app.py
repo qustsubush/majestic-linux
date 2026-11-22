@@ -17,7 +17,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QAbstractButton, QApplication, QComboBox, QFileDialog, QFrame, QHBoxLayout, QLabel,
     QLineEdit, QListWidget, QMainWindow, QPlainTextEdit,
-    QMessageBox, QPushButton, QSizePolicy, QStackedWidget, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QStackedWidget,
+    QVBoxLayout, QWidget,
 )
 
 SRC_DIR = Path(__file__).resolve().parents[1]
@@ -29,7 +30,7 @@ os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.services.warning=false")
 
 import backend.patch as core
 import i18n
-from backend import logs, patch_proton
+from backend import debug, logs, patch_proton
 from i18n import t
 
 APP_VERSION = "2.1.0"
@@ -66,10 +67,12 @@ QListWidget {{ background: #1b1b1b; border: none; outline: 0; }}
 QListWidget::item {{ padding: 9px 12px; }}
 QListWidget::item:selected {{ background: #2e2e2e; color: white; }}
 QListWidget::item:hover {{ background: #262626; }}
-QLineEdit, QPlainTextEdit {{
+QLineEdit, QPlainTextEdit, QSpinBox {{
     background: #1b1b1b; border: 1px solid #3c3c3c; border-radius: 3px; padding: 5px;
 }}
-QLineEdit:focus {{ border-color: {ACCENT}; }}
+QLineEdit:focus, QSpinBox:focus {{ border-color: {ACCENT}; }}
+QScrollArea {{ border: none; background: transparent; }}
+#scrollInner {{ background: transparent; }}
 #row {{ border-bottom: 1px solid #333333; }}
 #muted {{ color: #8a8a8a; }}
 #pageTitle {{ font-size: 16px; font-weight: bold; }}
@@ -97,10 +100,27 @@ def open_logs():
         QMessageBox.warning(None, "Majestic Linux", str(e))
 
 
+def load_debug(s: QSettings) -> tuple[dict, str]:
+    values: dict = {}
+    for opt in debug.OPTIONS:
+        key = f"dbg/{opt.id}"
+        if opt.kind == "bool":
+            values[opt.id] = s.value(key, opt.default, type=bool)
+        elif opt.kind == "int":
+            values[opt.id] = s.value(key, opt.default, type=int)
+        else:
+            value = str(s.value(key, opt.default))
+            values[opt.id] = value if value in opt.choices else opt.default
+    return values, str(s.value("dbg/extra", ""))
+
+
 def load_config(s: QSettings) -> core.Config:
+    values, extra = load_debug(s) if s.value("debug", False, type=bool) else ({}, "")
     cfg = core.Config(
         extra_args=str(s.value("extra_args", DEFAULT_ARGS)),
         proton=str(s.value("proton", "")),
+        debug=values,
+        debug_extra=extra,
     )
     core.use_config(cfg)
     return cfg
@@ -401,6 +421,7 @@ class DebugWindow(QWidget):
         self.cfg = cfg
         self.bus = LogBus()
         self.worker: Worker | None = None
+        self.diag_worker: Worker | None = None
         self.setWindowTitle(t("debug.title"))
         self.resize(780, 480)
 
@@ -415,6 +436,8 @@ class DebugWindow(QWidget):
         bar = QHBoxLayout()
         self.stop_btn = QPushButton(t("debug.stop_prefix"))
         self.stop_btn.clicked.connect(self.stop_prefix)
+        self.diag_btn = QPushButton(t("dbg.diag.btn"))
+        self.diag_btn.clicked.connect(self.run_diag)
         self.copy_btn = QPushButton(t("btn.copy_log"))
         self.copy_btn.clicked.connect(self.copy_log)
         self.logs_btn = QPushButton(t("btn.open_logs"))
@@ -422,6 +445,7 @@ class DebugWindow(QWidget):
         self.status = QLabel(t("status.running"))
         self.status.setObjectName("muted")
         bar.addWidget(self.stop_btn)
+        bar.addWidget(self.diag_btn)
         bar.addWidget(self.copy_btn)
         bar.addWidget(self.logs_btn)
         bar.addStretch(1)
@@ -460,6 +484,20 @@ class DebugWindow(QWidget):
         QApplication.clipboard().setText(self.view.toPlainText())
         self.status.setText(t("status.log_copied"))
 
+    def run_diag(self):
+        if self.diag_worker and self.diag_worker.isRunning():
+            return
+
+        def job(w: Worker):
+            core.run_diagnostics(w.line.emit)
+            return 0
+
+        self.diag_worker = Worker(job)
+        self.diag_worker.line.connect(self.bus.push)
+        self.diag_worker.finished_with.connect(lambda _: self.diag_btn.setEnabled(True))
+        self.diag_btn.setEnabled(False)
+        self.diag_worker.start()
+
     def _on_finished(self, code):
         self.bus.push(t("gui.finished", code=code))
         self.stop_btn.setEnabled(False)
@@ -473,6 +511,8 @@ class DebugWindow(QWidget):
                 return
             core.stop(force=True)
             self.worker.wait(3000)
+        if self.diag_worker and self.diag_worker.isRunning():
+            self.diag_worker.wait(3000)
         self.bus.close()
         if self in _debug_windows:
             _debug_windows.remove(self)
@@ -876,7 +916,166 @@ class SettingsPage(QWidget):
         self.args.retranslate()
 
 
+class DebugPage(QWidget):
+    def __init__(self, settings: QSettings):
+        super().__init__()
+        self.settings = settings
+        self.bus = LogBus("diag-")
+        self.worker: Worker | None = None
+        self._rows: list[tuple[debug.Option, SettingRow]] = []
+        self._group_labels: dict[str, QLabel] = {}
+        self._combos: dict[str, tuple[debug.Option, QComboBox]] = {}
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 14, 14, 14)
+        root.setSpacing(8)
+        self.title = QLabel()
+        self.title.setObjectName("pageTitle")
+        root.addWidget(self.title)
+        self.hint = QLabel()
+        self.hint.setObjectName("muted")
+        self.hint.setWordWrap(True)
+        root.addWidget(self.hint)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        inner = QWidget()
+        inner.setObjectName("scrollInner")
+        box = QVBoxLayout(inner)
+        box.setContentsMargins(0, 0, 10, 0)
+        box.setSpacing(0)
+        for group in debug.GROUPS:
+            label = QLabel()
+            label.setStyleSheet("font-weight: bold;")
+            box.addSpacing(10)
+            box.addWidget(label)
+            self._group_labels[group] = label
+            for opt in debug.OPTIONS:
+                if opt.group != group:
+                    continue
+                row = SettingRow(self._make_widget(opt))
+                box.addWidget(row)
+                self._rows.append((opt, row))
+
+        self.extra_edit = QPlainTextEdit(str(settings.value("dbg/extra", "")))
+        self.extra_edit.setFont(QFont("monospace", 9))
+        self.extra_edit.setFixedHeight(76)
+        self.extra_edit.setMinimumWidth(300)
+        self.extra_edit.textChanged.connect(
+            lambda: settings.setValue("dbg/extra", self.extra_edit.toPlainText()))
+        self.extra_row = SettingRow(self.extra_edit)
+        box.addSpacing(10)
+        box.addWidget(self.extra_row)
+        box.addStretch(1)
+        scroll.setWidget(inner)
+        root.addWidget(scroll, 3)
+
+        bar = QHBoxLayout()
+        self.diag_btn = QPushButton()
+        self.diag_btn.clicked.connect(self.run_diag)
+        self.folder_btn = QPushButton()
+        self.folder_btn.clicked.connect(self.open_metrics)
+        self.copy_btn = QPushButton()
+        self.copy_btn.clicked.connect(self.copy_log)
+        self.status = QLabel()
+        self.status.setObjectName("muted")
+        bar.addWidget(self.diag_btn)
+        bar.addWidget(self.folder_btn)
+        bar.addWidget(self.copy_btn)
+        bar.addStretch(1)
+        bar.addWidget(self.status)
+        root.addLayout(bar)
+
+        self.log = new_log_view()
+        self.log.setMinimumHeight(110)
+        self.bus.line.connect(self.log.appendPlainText)
+        root.addWidget(self.log, 2)
+
+        self.retranslate()
+
+    def _make_widget(self, opt: debug.Option) -> QWidget:
+        key = f"dbg/{opt.id}"
+        if opt.kind == "bool":
+            switch = ToggleSwitch(self.settings.value(key, opt.default, type=bool))
+            switch.toggled.connect(lambda v, k=key: self.settings.setValue(k, v))
+            return switch
+        if opt.kind == "int":
+            spin = QSpinBox()
+            spin.setRange(0, 360)
+            spin.setFixedWidth(90)
+            spin.setValue(self.settings.value(key, opt.default, type=int))
+            spin.valueChanged.connect(lambda v, k=key: self.settings.setValue(k, v))
+            return spin
+        combo = QComboBox()
+        combo.setMinimumWidth(190)
+        combo.currentIndexChanged.connect(
+            lambda _, c=combo, k=key: self.settings.setValue(k, c.currentData()))
+        self._combos[opt.id] = (opt, combo)
+        return combo
+
+    def _fill_combo(self, opt: debug.Option, combo: QComboBox):
+        stored = str(self.settings.value(f"dbg/{opt.id}", opt.default))
+        combo.blockSignals(True)
+        combo.clear()
+        for choice in opt.choices:
+            combo.addItem(t(f"dbg.{opt.id}.{choice}"), choice)
+        index = combo.findData(stored)
+        combo.setCurrentIndex(index if index >= 0 else combo.findData(opt.default))
+        combo.blockSignals(False)
+
+    def retranslate(self):
+        self.title.setText(t("nav.debug"))
+        self.hint.setText(t("dbg.hint"))
+        for group, label in self._group_labels.items():
+            label.setText(t(f"dbg.group.{group}"))
+        for opt, row in self._rows:
+            row.set_texts(t(f"dbg.{opt.id}.title"), t(f"dbg.{opt.id}.desc"))
+        for opt, combo in self._combos.values():
+            self._fill_combo(opt, combo)
+        self.extra_row.set_texts(t("dbg.extra.title"), t("dbg.extra.desc"))
+        self.extra_edit.setPlaceholderText(t("dbg.extra.placeholder"))
+        self.diag_btn.setText(t("dbg.diag.btn"))
+        self.folder_btn.setText(t("dbg.metrics.btn"))
+        self.copy_btn.setText(t("btn.copy_log"))
+        self.log.setPlaceholderText(t("dbg.diag.placeholder"))
+
+    def run_diag(self):
+        if self.worker and self.worker.isRunning():
+            return
+
+        def job(w: Worker):
+            core.run_diagnostics(w.line.emit)
+            return 0
+
+        self.log.clear()
+        self.bus.begin()
+        self.worker = Worker(job)
+        self.worker.line.connect(self.bus.push)
+        self.worker.finished_with.connect(self._diag_done)
+        self.diag_btn.setEnabled(False)
+        self.status.setText(t("dbg.diag.running"))
+        self.worker.start()
+
+    def _diag_done(self, code):
+        self.worker.wait()
+        self.diag_btn.setEnabled(True)
+        self.status.setText(t("dbg.diag.done"))
+
+    def open_metrics(self):
+        try:
+            core.open_dir(debug.MANGOHUD_DIR)
+        except core.SetupError as e:
+            QMessageBox.warning(self, "Majestic Linux", str(e))
+
+    def copy_log(self):
+        QApplication.clipboard().setText(self.log.toPlainText())
+        self.status.setText(t("status.log_copied"))
+
+
 class AddPage(QWidget):
+    debug_toggled = Signal(bool)
+
     def __init__(self, settings: QSettings):
         super().__init__()
         self._shortcut_msg: tuple[str, dict] | None = None
@@ -889,7 +1088,8 @@ class AddPage(QWidget):
         root.addSpacing(8)
 
         self.debug_switch = ToggleSwitch(settings.value("debug", False, type=bool))
-        self.debug_switch.toggled.connect(lambda v: settings.setValue("debug", v))
+        self.debug_switch.toggled.connect(
+            lambda v: (settings.setValue("debug", v), self.debug_toggled.emit(v)))
         self.debug_row = SettingRow(self.debug_switch)
         root.addWidget(self.debug_row)
 
@@ -956,7 +1156,9 @@ class AboutPage(QWidget):
         self.gh.setText(t("about.github"))
 
 
-NAV_KEYS = ("nav.general", "nav.install", "nav.settings", "nav.additional", "nav.about")
+NAV_KEYS = ("nav.general", "nav.install", "nav.settings", "nav.additional", "nav.debug",
+            "nav.about")
+DEBUG_ROW = NAV_KEYS.index("nav.debug")
 
 
 class MainWindow(QMainWindow):
@@ -1002,8 +1204,10 @@ class MainWindow(QMainWindow):
         self.general = GeneralPage(self.settings)
         self.installer = InstallPage(self.settings)
         self.settings_page = SettingsPage(self.settings)
+        self.add_page = AddPage(self.settings)
+        self.debug_page = DebugPage(self.settings)
         self.pages = [self.general, self.installer, self.settings_page,
-                      AddPage(self.settings), AboutPage()]
+                      self.add_page, self.debug_page, AboutPage()]
         for page in self.pages:
             self.stack.addWidget(page)
         self.settings_page.language_changed.connect(self.apply_language)
@@ -1014,6 +1218,8 @@ class MainWindow(QMainWindow):
         self.installer.running_changed.connect(self.settings_page.set_locked)
         outer.addWidget(self.stack, 1)
 
+        self.add_page.debug_toggled.connect(self.set_debug_visible)
+        self.set_debug_visible(self.settings.value("debug", False, type=bool))
         self.nav.currentRowChanged.connect(self.stack.setCurrentIndex)
         self.nav.setCurrentRow(0)
 
@@ -1023,9 +1229,18 @@ class MainWindow(QMainWindow):
             core.stop(force=True)
             for w in workers:
                 w.wait(3000)
+        diag = self.debug_page.worker
+        if diag and diag.isRunning():
+            diag.wait(3000)
         self.general.bus.close()
         self.installer.bus.close()
+        self.debug_page.bus.close()
         super().closeEvent(event)
+
+    def set_debug_visible(self, visible: bool):
+        self.nav.item(DEBUG_ROW).setHidden(not visible)
+        if not visible and self.nav.currentRow() == DEBUG_ROW:
+            self.nav.setCurrentRow(DEBUG_ROW - 1)
 
     def on_proton_changed(self):
         self.general.refresh()
